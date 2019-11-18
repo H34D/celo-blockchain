@@ -253,6 +253,32 @@ func ReadTd(db DatabaseReader, hash common.Hash, number uint64) *big.Int {
 	return td
 }
 
+// ReadAccumulatedUptime retrieves the so-far accumulated uptime array for the validators of the most recent epoch
+func ReadAccumulatedUptime(db DatabaseReader) []*big.Int {
+	data, _ := db.Get([]byte("uptime"))
+	if len(data) == 0 {
+		return nil
+	}
+	uptime := new([]*big.Int)
+	if err := rlp.Decode(bytes.NewReader(data), uptime); err != nil {
+		log.Error("Invalid uptime RLP", "err", err)
+		return nil
+	}
+	// todo: is it ok to deref here?
+	return *uptime
+}
+
+// WriteAccumulatedUptime updates the accumulated uptime array for the validators of the most recent epoch
+func WriteAccumulatedUptime(db DatabaseWriter, uptime []*big.Int) {
+	data, err := rlp.EncodeToBytes(uptime)
+	if err != nil {
+		log.Crit("Failed to RLP encode updated uptime", "err", err)
+	}
+	if err := db.Put([]byte("uptime"), data); err != nil {
+		log.Crit("Failed to store updated uptime", "err", err)
+	}
+}
+
 // WriteTd stores the total difficulty of a block into the database.
 func WriteTd(db DatabaseWriter, hash common.Hash, number uint64, td *big.Int) {
 	data, err := rlp.EncodeToBytes(td)

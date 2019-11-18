@@ -59,6 +59,7 @@ type HeaderChain struct {
 	headerCache *lru.Cache // Cache for the most recent block headers
 	tdCache     *lru.Cache // Cache for the most recent block total difficulties
 	numberCache *lru.Cache // Cache for the most recent block numbers
+	uptimeCache *lru.Cache // Cache for the most recent block numbers
 
 	procInterrupt func() bool
 
@@ -409,6 +410,30 @@ func (hc *HeaderChain) GetTdByHash(hash common.Hash) *big.Int {
 		return nil
 	}
 	return hc.GetTd(hash, *number)
+}
+
+// GetAccumulatedUptime retrieves the accumulated uptime for an epoch from the database,
+// caching it if found.
+func (hc *HeaderChain) GetAccumulatedUptime() []*big.Int {
+	// Short circuit if the uptime's already in the cache, retrieve otherwise
+	if cached, ok := hc.uptimeCache.Get("uptime"); ok {
+		return cached.([]*big.Int)
+	}
+	uptime := rawdb.ReadAccumulatedUptime(hc.chainDb)
+	if uptime == nil {
+		return nil
+	}
+	// Cache the found body for next time and return
+	hc.uptimeCache.Add("uptime", uptime)
+	return uptime
+}
+
+// WriteAccumulatedUptime stores the accumulated uptime for an epoch into the database, also caching it
+// along the way.
+func (hc *HeaderChain) WriteAccumulatedUptime(uptime []*big.Int) error {
+	rawdb.WriteAccumulatedUptime(hc.chainDb, uptime)
+	hc.uptimeCache.Add("uptime", uptime)
+	return nil
 }
 
 // WriteTd stores a block's total difficulty into the database, also caching it

@@ -929,6 +929,29 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	bc.wg.Add(1)
 	defer bc.wg.Done()
 
+	// Get the bitmap from the previous block
+	extra, err := types.ExtractIstanbulExtra(block.Header())
+	if err != nil {
+		return NonStatTy, errors.New("could not extract block header extra")
+	}
+	parentSeal := extra.ParentAggregatedSeal
+	signedValidatorsBitmap := parentSeal.Bitmap
+
+	// initialize the uptime if there was none before,
+	// otherwise increment it by the bitmap (assuming 1 in the bitmap means +1)
+	uptimeScore := bc.hc.GetAccumulatedUptime()
+	if len(uptimeScore) == 0 {
+		// convert the bitmap to a 0/1 array of big.Ints
+	} else {
+		for i := 0; i < len(uptimeScore); i++ {
+			valScore := signedValidatorsBitmap.Bit(i)
+			big.NewInt(0).Add(uptimeScore[i], big.NewInt(int64(valScore)))
+		}
+	}
+
+	// write the new score
+	bc.hc.WriteAccumulatedUptime(uptimeScore)
+
 	// Calculate the total difficulty of the block
 	ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
 	if ptd == nil {
