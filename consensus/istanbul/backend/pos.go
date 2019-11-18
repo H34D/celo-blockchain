@@ -20,7 +20,6 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
 	"github.com/ethereum/go-ethereum/contract_comm"
 	"github.com/ethereum/go-ethereum/contract_comm/currency"
@@ -79,9 +78,7 @@ func (sb *Backend) distributeEpochPaymentsAndRewards(header *types.Header, state
 
 func (sb *Backend) updateValidatorScores(header *types.Header, state *state.StateDB, valSet []istanbul.Validator) error {
 	for _, val := range valSet {
-		// TODO: Use actual uptime metric.
-		// 1.0 in fixidity
-		uptime := math.BigPow(10, 24)
+		uptime := state.GetUptime(val.Address())
 		sb.logger.Info("Updating validator score for address", "address", val.Address(), "uptime", uptime.String())
 		err := validators.UpdateValidatorScore(header, state, val.Address(), uptime)
 		if err != nil {
