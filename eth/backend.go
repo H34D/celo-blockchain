@@ -210,6 +210,7 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 				case chainHeadEvent := <-chainHeadCh:
 					istanbul.NewChainHead(chainHeadEvent.Block)
 				case <-chainHeadSub.Err():
+					log.Error("Error in istanbul's subscription to the blockchain's chainhead event", "err", err)
 					return
 				}
 			}
@@ -266,10 +267,10 @@ func CreateConsensusEngine(ctx *node.ServiceContext, chainConfig *params.ChainCo
 			config.Istanbul.Epoch = chainConfig.Istanbul.Epoch
 		}
 		if chainConfig.Istanbul.LookbackWindow != 0 {
-			if chainConfig.Istanbul.LookbackWindow >= chainConfig.Istanbul.Epoch-1 {
-				panic("istanbul.lookbackwindow must be less than istanbul.epoch-1")
-			}
 			config.Istanbul.LookbackWindow = chainConfig.Istanbul.LookbackWindow
+		}
+		if chainConfig.Istanbul.LookbackWindow >= chainConfig.Istanbul.Epoch-1 {
+			log.Crit("istanbul.lookbackwindow must be less than istanbul.epoch-1")
 		}
 		config.Istanbul.ProposerPolicy = istanbul.ProposerPolicy(chainConfig.Istanbul.ProposerPolicy)
 		return istanbulBackend.New(&config.Istanbul, db)

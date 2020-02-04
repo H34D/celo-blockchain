@@ -696,6 +696,10 @@ var (
 		Name:  "proxy.proxyenodeurlpair",
 		Usage: "proxy enode URL pair separated by a semicolon.  The format should be \"<internal facing enode URL>;<external facing enode URL>\"",
 	}
+	ProxyAllowPrivateIPFlag = cli.BoolFlag{
+		Name:  "proxy.allowprivateip",
+		Usage: "Specifies whether private IP is allowed for external facing proxy enodeURL",
+	}
 )
 
 // MakeDataDir retrieves the currently requested data directory, terminating
@@ -1215,6 +1219,7 @@ func setIstanbul(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 		cfg.Istanbul.ProposerPolicy = istanbul.ProposerPolicy(ctx.GlobalUint64(IstanbulProposerPolicyFlag.Name))
 	}
 	cfg.Istanbul.ValidatorEnodeDBPath = stack.ResolvePath(cfg.Istanbul.ValidatorEnodeDBPath)
+	cfg.Istanbul.RoundStateDBPath = stack.ResolvePath(cfg.Istanbul.RoundStateDBPath)
 }
 
 func setProxyP2PConfig(ctx *cli.Context, proxyCfg *p2p.Config) {
@@ -1270,6 +1275,9 @@ func SetProxyConfig(ctx *cli.Context, nodeCfg *node.Config, ethCfg *eth.Config) 
 			Fatalf("Option --%s must be used if option --%s is used", ProxyEnodeURLPairFlag.Name, ProxiedFlag.Name)
 		} else {
 			proxyEnodeURLPair := strings.Split(ctx.String(ProxyEnodeURLPairFlag.Name), ";")
+			if len(proxyEnodeURLPair) != 2 {
+				Fatalf("Invalid usage for option --%s", ProxyEnodeURLPairFlag.Name)
+			}
 
 			var err error
 			if ethCfg.Istanbul.ProxyInternalFacingNode, err = enode.ParseV4(proxyEnodeURLPair[0]); err != nil {
@@ -1278,6 +1286,15 @@ func SetProxyConfig(ctx *cli.Context, nodeCfg *node.Config, ethCfg *eth.Config) 
 
 			if ethCfg.Istanbul.ProxyExternalFacingNode, err = enode.ParseV4(proxyEnodeURLPair[1]); err != nil {
 				Fatalf("Proxy external facing enodeURL (%s) invalid with err: %v", proxyEnodeURLPair[1], err)
+			}
+
+			// Check that external IP is not a private IP address.
+			if ethCfg.Istanbul.ProxyExternalFacingNode.IsPrivateIP() {
+				if ctx.GlobalBool(ProxyAllowPrivateIPFlag.Name) {
+					log.Warn("Proxy external facing enodeURL (%s) is private IP.", proxyEnodeURLPair[1])
+				} else {
+					Fatalf("Proxy external facing enodeURL (%s) cannot be private IP.", proxyEnodeURLPair[1])
+				}
 			}
 		}
 

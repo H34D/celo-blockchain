@@ -18,6 +18,7 @@ package core
 
 import (
 	"crypto/ecdsa"
+	"fmt"
 	"math"
 	"math/big"
 	"testing"
@@ -25,6 +26,7 @@ import (
 
 	bls "github.com/celo-org/bls-zexe/go"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
 	"github.com/ethereum/go-ethereum/consensus/istanbul/validator"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -53,18 +55,23 @@ type testSystemBackend struct {
 	blsKey  []byte
 	address common.Address
 	db      ethdb.Database
+
+	// Function pointer to a verify function, so that the test core_test.go/TestVerifyProposal
+	// can inject in different proposal verification statuses.
+	verifyImpl func(proposal istanbul.Proposal) (time.Duration, error)
 }
 
 type testCommittedMsgs struct {
-	commitProposal istanbul.Proposal
-	aggregatedSeal types.IstanbulAggregatedSeal
+	commitProposal                  istanbul.Proposal
+	aggregatedSeal                  types.IstanbulAggregatedSeal
+	aggregatedEpochValidatorSetSeal types.IstanbulEpochValidatorSetSeal
 }
 
 // ==============================================
 //
 // define the functions that needs to be provided for Istanbul.
 
-func (self *testSystemBackend) Authorize(address common.Address, _ istanbul.SignerFn, _ istanbul.SignerFn, _ istanbul.MessageSignerFn) {
+func (self *testSystemBackend) Authorize(address common.Address, _ istanbul.SignerFn, _ istanbul.BLSSignerFn, _ istanbul.MessageSignerFn) {
 	self.address = address
 	self.engine.SetAddress(address)
 }
@@ -76,6 +83,11 @@ func (self *testSystemBackend) Address() common.Address {
 // Peers returns all connected peers
 func (self *testSystemBackend) Validators(proposal istanbul.Proposal) istanbul.ValidatorSet {
 	return self.peers
+}
+
+func (self *testSystemBackend) NextBlockValidators(proposal istanbul.Proposal) (istanbul.ValidatorSet, error) {
+	//This doesn't really return the next block validators
+	return self.peers, nil
 }
 
 func (self *testSystemBackend) EventMux() *event.TypeMux {
@@ -99,11 +111,12 @@ func (self *testSystemBackend) BroadcastConsensusMsg(validators []common.Address
 	}
 	return nil
 }
+
 func (self *testSystemBackend) Gossip(validators []common.Address, message []byte, msgCode uint64, ignoreCache bool) error {
 	return nil
 }
 
-func (self *testSystemBackend) SignBlockHeader(data []byte) ([]byte, error) {
+func (self *testSystemBackend) SignBlockHeader(data []byte) (blscrypto.SerializedSignature, error) {
 	privateKey, _ := bls.DeserializePrivateKey(self.blsKey)
 	defer privateKey.Destroy()
 
@@ -111,14 +124,26 @@ func (self *testSystemBackend) SignBlockHeader(data []byte) ([]byte, error) {
 	defer signature.Destroy()
 	signatureBytes, _ := signature.Serialize()
 
-	return signatureBytes, nil
+	return blscrypto.SerializedSignatureFromBytes(signatureBytes)
 }
 
-func (self *testSystemBackend) Commit(proposal istanbul.Proposal, aggregatedSeal types.IstanbulAggregatedSeal) error {
+func (self *testSystemBackend) SignBLSWithCompositeHash(data []byte) (blscrypto.SerializedSignature, error) {
+	privateKey, _ := bls.DeserializePrivateKey(self.blsKey)
+	defer privateKey.Destroy()
+
+	signature, _ := privateKey.SignMessage(data, []byte{}, true)
+	defer signature.Destroy()
+	signatureBytes, _ := signature.Serialize()
+
+	return blscrypto.SerializedSignatureFromBytes(signatureBytes)
+}
+
+func (self *testSystemBackend) Commit(proposal istanbul.Proposal, aggregatedSeal types.IstanbulAggregatedSeal, aggregatedEpochValidatorSetSeal types.IstanbulEpochValidatorSetSeal) error {
 	testLogger.Info("commit message", "address", self.Address())
 	self.committedMsgs = append(self.committedMsgs, testCommittedMsgs{
-		commitProposal: proposal,
-		aggregatedSeal: aggregatedSeal,
+		commitProposal:                  proposal,
+		aggregatedSeal:                  aggregatedSeal,
+		aggregatedEpochValidatorSetSeal: aggregatedEpochValidatorSetSeal,
 	})
 
 	// fake new head events
@@ -127,7 +152,23 @@ func (self *testSystemBackend) Commit(proposal istanbul.Proposal, aggregatedSeal
 }
 
 func (self *testSystemBackend) Verify(proposal istanbul.Proposal) (time.Duration, error) {
+	if self.verifyImpl == nil {
+		return self.verifyWithSuccess(proposal)
+	} else {
+		return self.verifyImpl(proposal)
+	}
+}
+
+func (self *testSystemBackend) verifyWithSuccess(proposal istanbul.Proposal) (time.Duration, error) {
 	return 0, nil
+}
+
+func (self *testSystemBackend) verifyWithFailure(proposal istanbul.Proposal) (time.Duration, error) {
+	return 0, InvalidProposalError
+}
+
+func (self *testSystemBackend) verifyWithFutureProposal(proposal istanbul.Proposal) (time.Duration, error) {
+	return 5, consensus.ErrFutureBlock
 }
 
 func (self *testSystemBackend) Sign(data []byte) ([]byte, error) {
@@ -159,7 +200,6 @@ func (self *testSystemBackend) GetCurrentHeadBlock() istanbul.Proposal {
 		testLogger.Info("have proposal for block", "num", l)
 		return self.committedMsgs[l-1].commitProposal
 	}
-	testLogger.Info("do not have proposal for block", "num", 0)
 	return makeBlock(0)
 }
 
@@ -169,7 +209,6 @@ func (self *testSystemBackend) GetCurrentHeadBlockAndAuthor() (istanbul.Proposal
 		testLogger.Info("have proposal for block", "num", l)
 		return self.committedMsgs[l-1].commitProposal, common.Address{}
 	}
-	testLogger.Info("do not have proposal for block", "num", 0)
 	return makeBlock(0), common.Address{}
 }
 
@@ -234,7 +273,7 @@ func (self *testSystemBackend) getCommitMessage(view istanbul.View, proposal ist
 
 	committedSubject := &istanbul.CommittedSubject{
 		Subject:       subject,
-		CommittedSeal: committedSeal,
+		CommittedSeal: committedSeal[:],
 	}
 
 	payload, err := Encode(committedSubject)
@@ -247,15 +286,16 @@ func (self *testSystemBackend) getCommitMessage(view istanbul.View, proposal ist
 		Msg:  payload,
 	}
 
-	// We swap in the provided proposal so that the message is finalized for the provided proposal
-	// and not for the current preprepare.
-	cachePreprepare := self.engine.(*core).current.Preprepare()
-	self.engine.(*core).current.(*roundStateImpl).preprepare = &istanbul.Preprepare{
-		View:     &view,
-		Proposal: proposal,
-	}
+	// // We swap in the provided proposal so that the message is finalized for the provided proposal
+	// // and not for the current preprepare.
+	// cachePreprepare := self.engine.(*core).current.Preprepare()
+	// fmt.Println("5")
+	// self.engine.(*core).current.TransitionToPreprepared(&istanbul.Preprepare{
+	// 	View:     &view,
+	// 	Proposal: proposal,
+	// })
 	message, err := self.finalizeAndReturnMessage(msg)
-	self.engine.(*core).current.(*roundStateImpl).preprepare = cachePreprepare
+	// self.engine.(*core).current.TransitionToPreprepared(cachePreprepare)
 	return message, err
 }
 
@@ -283,6 +323,10 @@ func (self *testSystemBackend) Enode() *enode.Node {
 }
 
 func (self *testSystemBackend) RefreshValPeers(valSet istanbul.ValidatorSet) {}
+
+func (self *testSystemBackend) setVerifyImpl(verifyImpl func(proposal istanbul.Proposal) (time.Duration, error)) {
+	self.verifyImpl = verifyImpl
+}
 
 // ==============================================
 //
@@ -331,39 +375,32 @@ func generateValidators(n int) ([]istanbul.ValidatorData, [][]byte, []*ecdsa.Pri
 
 func newTestValidatorSet(n int) istanbul.ValidatorSet {
 	validators, _, _ := generateValidators(n)
-	return validator.NewSet(validators, istanbul.RoundRobin)
-}
-
-func NewTestSystemWithBackend(n, f uint64) *testSystem {
-	return NewTestSystemWithBackendAndCurrentRoundState(n, f, func(vset istanbul.ValidatorSet) RoundState {
-		return newRoundState(&istanbul.View{
-			Round:    big.NewInt(0),
-			Sequence: big.NewInt(1),
-		}, vset, nil, nil, istanbul.EmptyPreparedCertificate(), nil)
-	})
+	return validator.NewSet(validators)
 }
 
 // FIXME: int64 is needed for N and F
-func NewTestSystemWithBackendAndCurrentRoundState(n, f uint64, getRoundState func(vset istanbul.ValidatorSet) RoundState) *testSystem {
+func NewTestSystemWithBackend(n, f uint64) *testSystem {
 	testLogger.SetHandler(elog.StdoutHandler)
 
 	validators, blsKeys, keys := generateValidators(int(n))
 	sys := newTestSystem(n, f, blsKeys)
-	config := istanbul.DefaultConfig
+	config := *istanbul.DefaultConfig
+	config.ProposerPolicy = istanbul.RoundRobin
+	config.RoundStateDBPath = ""
+	config.RequestTimeout = 300
+	config.TimeoutBackoffFactor = 100
+	config.MinResendRoundChangeTimeout = 1000
+	config.MaxResendRoundChangeTimeout = 10000
 
 	for i := uint64(0); i < n; i++ {
-		vset := validator.NewSet(validators, istanbul.RoundRobin)
+		vset := validator.NewSet(validators)
 		backend := sys.NewBackend(i)
 		backend.peers = vset
 		backend.address = vset.GetByIndex(i).Address()
 		backend.key = *keys[i]
 		backend.blsKey = blsKeys[i]
 
-		core := New(backend, config).(*core)
-		core.state = StateAcceptRequest
-		core.current = getRoundState(vset)
-		core.roundChangeSet = newRoundChangeSet(vset)
-		core.valSet = vset
+		core := New(backend, &config).(*core)
 		core.logger = testLogger
 		core.validateFn = backend.CheckValidatorSignature
 
@@ -395,7 +432,11 @@ func (t *testSystem) listen() {
 func (t *testSystem) Run(core bool) func() {
 	for _, b := range t.backends {
 		if core {
-			b.engine.Start() // start Istanbul core
+			err := b.engine.Start() // start Istanbul core
+			if err != nil {
+				fmt.Printf("Error Starting istanbul engine: %s", err)
+				panic("Error Starting istanbul engine")
+			}
 		}
 	}
 
@@ -409,7 +450,11 @@ func (t *testSystem) stop(core bool) {
 
 	for _, b := range t.backends {
 		if core {
-			b.engine.Stop()
+			err := b.engine.Stop()
+			if err != nil {
+				fmt.Printf("Error Stopping istanbul engine: %s", err)
+				panic("Error Stopping istanbul engine")
+			}
 		}
 	}
 }
@@ -460,13 +505,13 @@ func (sys *testSystem) getPreparedCertificate(t *testing.T, views []istanbul.Vie
 	return preparedCertificate
 }
 
-func (sys *testSystem) getRoundChangeCertificate(t *testing.T, view istanbul.View, preparedCertificate istanbul.PreparedCertificate) istanbul.RoundChangeCertificate {
+func (sys *testSystem) getRoundChangeCertificate(t *testing.T, views []istanbul.View, preparedCertificate istanbul.PreparedCertificate) istanbul.RoundChangeCertificate {
 	var roundChangeCertificate istanbul.RoundChangeCertificate
 	for i, backend := range sys.backends {
 		if uint64(i) == sys.MinQuorumSize() {
 			break
 		}
-		msg, err := backend.getRoundChangeMessage(view, preparedCertificate)
+		msg, err := backend.getRoundChangeMessage(views[i%len(views)], preparedCertificate)
 		if err != nil {
 			t.Errorf("Failed to create ROUND CHANGE message: %v", err)
 		}

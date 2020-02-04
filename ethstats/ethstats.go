@@ -69,9 +69,9 @@ const (
 	// delegateSendTimeout waits for the proxy to sign a message
 	delegateSendTimeout = 5
 	// statusUpdateInterval is the frequency of sending full node reports
-	statusUpdateInterval = 15
+	statusUpdateInterval = 13
 	// valSetInterval is the frequency in blocks to send the validator set
-	valSetInterval = 10
+	valSetInterval = 11
 
 	actionBlock    = "block"
 	actionHello    = "hello"
@@ -96,14 +96,14 @@ type blockChain interface {
 // Service implements an Ethereum netstats reporting daemon that pushes local
 // chain statistics up to a monitoring server.
 type Service struct {
-	server  *p2p.Server              // Peer-to-peer server to retrieve networking infos
-	eth     *eth.Ethereum            // Full Ethereum service if monitoring a full node
-	les     *les.LightEthereum       // Light Ethereum service if monitoring a light node
-	engine  consensus.Engine         // Consensus engine to retrieve variadic block fields
-	backend *istanbulBackend.Backend // Istanbul consensus backend
-
-	node string // Name of the node to display on the monitoring page
-	host string // Remote address of the monitoring service
+	server    *p2p.Server              // Peer-to-peer server to retrieve networking infos
+	eth       *eth.Ethereum            // Full Ethereum service if monitoring a full node
+	les       *les.LightEthereum       // Light Ethereum service if monitoring a light node
+	engine    consensus.Engine         // Consensus engine to retrieve variadic block fields
+	backend   *istanbulBackend.Backend // Istanbul consensus backend
+	etherBase common.Address
+	node      string // Name of the node to display on the monitoring page
+	host      string // Remote address of the monitoring service
 
 	pongCh chan struct{} // Pong notifications are fed into this channel
 	histCh chan []uint64 // History request block numbers are fed into this channel
@@ -119,16 +119,14 @@ func New(url string, ethServ *eth.Ethereum, lesServ *les.LightEthereum) (*Servic
 	}
 	// Assemble and return the stats service
 	var (
-		engine consensus.Engine
-		id     string
+		engine    consensus.Engine
+		etherBase common.Address
+		id        string
 	)
 	id = parts[1]
 	if ethServ != nil {
 		engine = ethServ.Engine()
-		etherBase, err := ethServ.Etherbase()
-		if err == nil {
-			id = strings.ToLower(etherBase.String())
-		}
+		etherBase, _ = ethServ.Etherbase()
 	} else {
 		engine = lesServ.Engine()
 	}
@@ -136,14 +134,15 @@ func New(url string, ethServ *eth.Ethereum, lesServ *les.LightEthereum) (*Servic
 	backend := engine.(*istanbulBackend.Backend)
 
 	return &Service{
-		eth:     ethServ,
-		les:     lesServ,
-		engine:  engine,
-		backend: backend,
-		node:    id,
-		host:    parts[2],
-		pongCh:  make(chan struct{}),
-		histCh:  make(chan []uint64, 1),
+		eth:       ethServ,
+		les:       lesServ,
+		engine:    engine,
+		backend:   backend,
+		etherBase: etherBase,
+		node:      id,
+		host:      parts[2],
+		pongCh:    make(chan struct{}),
+		histCh:    make(chan []uint64, 1),
 	}, nil
 }
 
@@ -215,10 +214,6 @@ func (s *Service) loop() {
 		txpool = s.les.TxPool()
 	}
 
-	chainHeadCh := make(chan core.ChainHeadEvent, chainHeadChanSize)
-	headSub := blockchain.SubscribeChainHeadEvent(chainHeadCh)
-	defer headSub.Unsubscribe()
-
 	txEventCh := make(chan core.NewTxsEvent, txChanSize)
 	txSub := txpool.SubscribeNewTxsEvent(txEventCh)
 	defer txSub.Unsubscribe()
@@ -237,6 +232,10 @@ func (s *Service) loop() {
 	)
 	go func() {
 		var lastTx mclock.AbsTime
+
+		chainHeadCh := make(chan core.ChainHeadEvent, chainHeadChanSize)
+		headSub := blockchain.SubscribeChainHeadEvent(chainHeadCh)
+		defer headSub.Unsubscribe()
 
 	HandleLoop:
 		for {
@@ -278,7 +277,13 @@ func (s *Service) loop() {
 					// proxied validator should sign
 					channel = signCh
 				}
-				channel <- &statsPayload
+				// TODO: This is a hacky measure to avoid blocking here if the
+				// channel is not consuming
+				select {
+				case channel <- &statsPayload:
+				default:
+				}
+
 			}
 		}
 		close(quitCh)
@@ -446,7 +451,7 @@ func (s *Service) login(conn *websocket.Conn, sendCh chan *StatsPayload) error {
 	// Retrieve the remote ack or connection termination
 	var ack map[string][]string
 	if err := websocket.JSON.Receive(conn, &ack); err != nil {
-		return err
+		return errors.New("unauthorized, try registering your validator to get whitelisted")
 	}
 	emit, ok := ack["emit"]
 	if !ok {
@@ -570,7 +575,8 @@ func (s *Service) readLoop(conn *websocket.Conn) {
 // server. Use the individual methods for reporting subscribed events.
 func (s *Service) report(conn *websocket.Conn, sendCh chan *StatsPayload) error {
 	if err := s.reportLatency(conn, sendCh); err != nil {
-		return err
+		log.Warn("Latency failed to report", "err", err)
+		return nil
 	}
 	if err := s.reportBlock(conn, nil); err != nil {
 		return err
@@ -838,38 +844,39 @@ type validatorSet struct {
 
 type validatorInfo struct {
 	Address        common.Address `json:"address"`
-	Name           string         `json:"name"`
 	Score          string         `json:"score"`
 	BLSPublicKey   []byte         `json:"blsPublicKey"`
 	EcdsaPublicKey []byte         `json:"ecdsaPublicKey"`
 	Affiliation    common.Address `json:"affiliation"`
+	Signer         common.Address `json:"signer"`
 }
 
 func (s *Service) assembleValidatorSet(block *types.Block, state vm.StateDB) validatorSet {
 	var (
+		err            error
 		valSet         validatorSet
 		valsRegistered []validatorInfo
 		valsElected    []common.Address
 	)
 
 	// Add set of registered validators
-	valsRegisteredMap, _ := validators.RetrieveRegisteredValidators(nil, nil)
+	valsRegisteredMap, _ := validators.RetrieveRegisteredValidators(s.eth.BlockChain().CurrentHeader(), state)
 	valsRegistered = make([]validatorInfo, 0, len(valsRegisteredMap))
-
 	for _, address := range valsRegisteredMap {
 		var valData validators.ValidatorContractData
-		valData, _ = validators.GetValidator(
-			s.eth.BlockChain().CurrentHeader(),
-			state,
-			address)
+		valData, err = validators.GetValidator(s.eth.BlockChain().CurrentHeader(), state, address)
+
+		if err != nil {
+			log.Warn("Validator data not found", "address", address.Hex(), "err", err)
+		}
 
 		valsRegistered = append(valsRegistered, validatorInfo{
 			Address:        address,
 			Score:          fmt.Sprintf("%d", valData.Score),
-			Name:           address.String(),
 			BLSPublicKey:   valData.BlsPublicKey,
 			EcdsaPublicKey: valData.EcdsaPublicKey,
 			Affiliation:    valData.Affiliation,
+			Signer:         valData.Signer,
 		})
 	}
 
@@ -981,6 +988,7 @@ type nodeStats struct {
 	Active   bool `json:"active"`
 	Syncing  bool `json:"syncing"`
 	Mining   bool `json:"mining"`
+	Proxy    bool `json:"proxy"`
 	Elected  bool `json:"elected"`
 	Hashrate int  `json:"hashrate"`
 	Peers    int  `json:"peers"`
@@ -995,6 +1003,7 @@ func (s *Service) reportStats(conn *websocket.Conn) error {
 	var (
 		etherBase common.Address
 		mining    bool
+		proxy     bool
 		elected   bool
 		hashrate  int
 		syncing   bool
@@ -1004,11 +1013,13 @@ func (s *Service) reportStats(conn *websocket.Conn) error {
 		etherBase, _ = s.eth.Etherbase()
 		block := s.eth.BlockChain().CurrentBlock()
 
+		proxy = s.backend.IsProxy()
 		mining = s.eth.Miner().Mining()
 		hashrate = int(s.eth.Miner().HashRate())
 
 		elected = false
 		valsElected := s.backend.GetValidators(block.Number(), block.Hash())
+
 		for i := range valsElected {
 			if valsElected[i].Address() == etherBase {
 				elected = true
@@ -1034,6 +1045,7 @@ func (s *Service) reportStats(conn *websocket.Conn) error {
 			Active:   true,
 			Mining:   mining,
 			Elected:  elected,
+			Proxy:    proxy,
 			Hashrate: hashrate,
 			Peers:    s.server.PeerCount(),
 			GasPrice: gasprice,

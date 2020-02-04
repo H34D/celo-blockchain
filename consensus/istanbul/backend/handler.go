@@ -62,7 +62,7 @@ func (sb *Backend) HandleMsg(addr common.Address, msg p2p.Msg, peer consensus.Pe
 	sb.coreMu.Lock()
 	defer sb.coreMu.Unlock()
 
-	sb.logger.Trace("HandleMsg called", "address", addr, "msg", msg, "peer.Node()", peer.Node())
+	sb.logger.Trace("HandleMsg called", "address", addr, "m", msg, "peer", peer.Node())
 
 	if sb.isIstanbulMsg(msg) {
 		if (!sb.coreStarted && !sb.config.Proxy) && (msg.Code == istanbulConsensusMsg) {
@@ -71,7 +71,11 @@ func (sb *Backend) HandleMsg(addr common.Address, msg p2p.Msg, peer consensus.Pe
 
 		var data []byte
 		if err := msg.Decode(&data); err != nil {
-			sb.logger.Error("Failed to decode message payload", "msg", msg)
+			if err == errUnauthorized {
+				sb.logger.Debug("Failed to decode message payload", "err", err)
+			} else {
+				sb.logger.Error("Failed to decode message payload", "err", err)
+			}
 			return true, errDecodeFailed
 		}
 
@@ -130,7 +134,7 @@ func (sb *Backend) handleConsensusMsg(peer consensus.Peer, payload []byte) error
 		}
 
 		// Need to forward the message to the proxied validator
-		sb.logger.Debug("Forwarding consensus message to proxied validator")
+		sb.logger.Trace("Forwarding consensus message to proxied validator")
 		if sb.proxiedPeer != nil {
 			go sb.proxiedPeer.Send(istanbulConsensusMsg, payload)
 		}
@@ -223,11 +227,8 @@ func (sb *Backend) NewChainHead(newBlock *types.Block) {
 		// Output whether this validator was or wasn't elected for the
 		// new epoch's validator set
 		if sb.coreStarted {
-			if _, val := valset.GetByAddress(sb.ValidatorAddress()); val != nil {
-				sb.logger.Info("Validators Election Results: Node IN ValidatorSet")
-			} else {
-				sb.logger.Info("Validators Election Results: Node OUT ValidatorSet")
-			}
+			_, val := valset.GetByAddress(sb.ValidatorAddress())
+			sb.logger.Info("Validator Election Results", "address", sb.ValidatorAddress(), "elected", (val != nil), "number", newBlock.Number().Uint64())
 
 			sb.newEpochCh <- struct{}{}
 		}

@@ -25,12 +25,14 @@ import (
 	"sort"
 	"time"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
 	vet "github.com/ethereum/go-ethereum/consensus/istanbul/backend/internal/enodes"
 	contract_errors "github.com/ethereum/go-ethereum/contract_comm/errors"
 	"github.com/ethereum/go-ethereum/contract_comm/validators"
-	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/rlp"
 )
@@ -51,11 +53,11 @@ func (ar *announceRecord) String() string {
 type announceData struct {
 	AnnounceRecords []*announceRecord
 	EnodeURLHash    common.Hash
-	View            *istanbul.View
+	Timestamp       uint
 }
 
 func (ad *announceData) String() string {
-	return fmt.Sprintf("{View: %v, EnodeURLHash: %v, AnnounceRecords: %v}", ad.View, ad.EnodeURLHash.Hex(), ad.AnnounceRecords)
+	return fmt.Sprintf("{Timestamp: %v, EnodeURLHash: %v, AnnounceRecords: %v}", ad.Timestamp, ad.EnodeURLHash.Hex(), ad.AnnounceRecords)
 }
 
 // ==============================================
@@ -83,7 +85,7 @@ func (ar *announceRecord) DecodeRLP(s *rlp.Stream) error {
 
 // EncodeRLP serializes ad into the Ethereum RLP format.
 func (ad *announceData) EncodeRLP(w io.Writer) error {
-	return rlp.Encode(w, []interface{}{ad.AnnounceRecords, ad.EnodeURLHash, ad.View})
+	return rlp.Encode(w, []interface{}{ad.AnnounceRecords, ad.EnodeURLHash, ad.Timestamp})
 }
 
 // DecodeRLP implements rlp.Decoder, and load the ad fields from a RLP stream.
@@ -91,32 +93,89 @@ func (ad *announceData) DecodeRLP(s *rlp.Stream) error {
 	var msg struct {
 		AnnounceRecords []*announceRecord
 		EnodeURLHash    common.Hash
-		View            *istanbul.View
+		Timestamp       uint
 	}
 
 	if err := s.Decode(&msg); err != nil {
 		return err
 	}
-	ad.AnnounceRecords, ad.EnodeURLHash, ad.View = msg.AnnounceRecords, msg.EnodeURLHash, msg.View
+	ad.AnnounceRecords, ad.EnodeURLHash, ad.Timestamp = msg.AnnounceRecords, msg.EnodeURLHash, msg.Timestamp
 	return nil
 }
 
-// This function is meant to be run as a goroutine.  It will periodically gossip announce messages
-// to the rest of the registered validators to communicate it's enodeURL to them.
+// ==============================================
+//
+// define the constant, types, and function for the sendAnnounce thread
+
+type AnnounceFrequencyState int
+
+const (
+	// In this state, send out an announce message every 1 minute until the first peer is established
+	HighFreqBeforeFirstPeerState AnnounceFrequencyState = iota
+
+	// In this state, send out an announce message every 1 minute for the first 10 announce messages after the first peer is established.
+	// This is on the assumption that when this node first establishes a peer, the p2p network that this node is in may
+	// be partitioned with the broader p2p network. We want to give that p2p network some time to connect to the broader p2p network.
+	HighFreqAfterFirstPeerState
+
+	// In this state, send out an announce message every 10 minutes
+	LowFreqState
+)
+
+const (
+	HighFreqTickerDuration = 1 * time.Minute
+	LowFreqTickerDuration  = 10 * time.Minute
+)
+
+// The sendAnnounce thread function
 func (sb *Backend) sendAnnounceMsgs() {
 	sb.announceWg.Add(1)
 	defer sb.announceWg.Done()
 
-	ticker := time.NewTicker(time.Minute)
+	// Send out an announce message when this thread starts
+	go sb.sendIstAnnounce()
+
+	// Set the initial states
+	announceThreadState := HighFreqBeforeFirstPeerState
+	currentTickerDuration := HighFreqTickerDuration
+	ticker := time.NewTicker(currentTickerDuration)
+	numSentMsgsInHighFreqAfterFirstPeerState := 0
 
 	for {
 		select {
 		case <-sb.newEpochCh:
 			go sb.sendIstAnnounce()
+
 		case <-ticker.C:
-			// output the valEnodeTable for debugging purposes
-			log.Trace("ValidatorEnodeDB dump", "ValidatorEnodeDB", sb.valEnodeTable.String())
+			switch announceThreadState {
+			case HighFreqBeforeFirstPeerState:
+				{
+					if len(sb.broadcaster.FindPeers(nil, p2p.AnyPurpose)) > 0 {
+						announceThreadState = HighFreqAfterFirstPeerState
+					}
+				}
+
+			case HighFreqAfterFirstPeerState:
+				{
+					if numSentMsgsInHighFreqAfterFirstPeerState >= 10 {
+						announceThreadState = LowFreqState
+					}
+					numSentMsgsInHighFreqAfterFirstPeerState += 1
+				}
+
+			case LowFreqState:
+				{
+					if currentTickerDuration != LowFreqTickerDuration {
+						// Reset the ticker
+						currentTickerDuration = LowFreqTickerDuration
+						ticker.Stop()
+						ticker = time.NewTicker(currentTickerDuration)
+					}
+				}
+			}
+
 			go sb.sendIstAnnounce()
+
 		case <-sb.announceQuit:
 			ticker.Stop()
 			return
@@ -136,7 +195,6 @@ func (sb *Backend) generateIstAnnounce() (*istanbul.Message, error) {
 	} else {
 		enodeUrl = sb.p2pserver.Self().String()
 	}
-	view := sb.core.CurrentView()
 
 	// If the message is not within the registered validator set, then ignore it
 	regAndActiveVals, err := sb.retrieveActiveAndRegisteredValidators()
@@ -153,7 +211,8 @@ func (sb *Backend) generateIstAnnounce() (*istanbul.Message, error) {
 	announceData := &announceData{
 		AnnounceRecords: announceRecords,
 		EnodeURLHash:    istanbul.RLPHash(enodeUrl),
-		View:            view,
+		// Unix() returns a int64, but we need a uint for the golang rlp encoding implmentation. Warning: This timestamp value will be truncated in 2106.
+		Timestamp: uint(time.Now().Unix()),
 	}
 
 	announceBytes, err := rlp.EncodeToBytes(announceData)
@@ -205,7 +264,7 @@ func (sb *Backend) sendIstAnnounce() error {
 func (sb *Backend) retrieveActiveAndRegisteredValidators() (map[common.Address]bool, error) {
 	validatorsSet := make(map[common.Address]bool)
 
-	registeredValidators, err := validators.RetrieveRegisteredValidators(nil, nil)
+	registeredValidators, err := validators.RetrieveRegisteredValidatorSigners(nil, nil)
 
 	// The validator contract may not be deployed yet.
 	// Even if it is deployed, it may not have any registered validators yet.
@@ -252,15 +311,19 @@ func (sb *Backend) handleIstAnnounce(payload []byte) error {
 	var announceData announceData
 	err = rlp.DecodeBytes(msg.Msg, &announceData)
 	if err != nil {
-		logger.Error("Error in decoding received Istanbul Announce message content", "err", err, "IstanbulMsg", msg.String())
+		logger.Warn("Error in decoding received Istanbul Announce message content", "err", err, "IstanbulMsg", msg.String())
 		return err
 	}
 
-	logger = logger.New("msgAddress", msg.Address, "msg_round", announceData.View.Round, "msg_seq", announceData.View.Sequence)
+	logger = logger.New("msgAddress", msg.Address, "msg_timestamp", announceData.Timestamp)
 
-	if view, err := sb.valEnodeTable.GetViewFromAddress(msg.Address); err == nil && announceData.View.Cmp(view) <= 0 {
-		logger.Trace("Received an old announce message", "senderAddr", msg.Address, "messageView", announceData.View, "currentEntryView", view)
-		return errOldAnnounceMessage
+	if currentEntryTimestamp, err := sb.valEnodeTable.GetTimestampFromAddress(msg.Address); err == nil {
+		if announceData.Timestamp < currentEntryTimestamp {
+			logger.Trace("Received an old announce message", "currentEntryTimestamp", currentEntryTimestamp)
+			return errOldAnnounceMessage
+		}
+	} else if err != leveldb.ErrNotFound {
+		logger.Warn("Error when retrieving timestamp for entry in the ValEnodeTable", "err", err)
 	}
 
 	// If the message is not within the registered validator set, then ignore it
@@ -270,7 +333,7 @@ func (sb *Backend) handleIstAnnounce(payload []byte) error {
 	}
 
 	if !regAndActiveVals[msg.Address] {
-		logger.Warn("Received an IstanbulAnnounce message from a non registered validator. Ignoring it.", "AnnounceMsg", msg.String(), "validators", regAndActiveVals, "err", err)
+		logger.Debug("Received an IstanbulAnnounce message from a non registered validator. Ignoring it.", "AnnounceMsg", msg.String(), "err", err)
 		return errUnauthorizedAnnounceMessage
 	}
 
@@ -299,7 +362,7 @@ func (sb *Backend) handleIstAnnounce(payload []byte) error {
 	}
 	// Save in the valEnodeTable if mining
 	if sb.coreStarted && node != nil {
-		if err := sb.valEnodeTable.Upsert(map[common.Address]*vet.AddressEntry{msg.Address: {Node: node, View: announceData.View}}); err != nil {
+		if err := sb.valEnodeTable.Upsert(map[common.Address]*vet.AddressEntry{msg.Address: {Node: node, Timestamp: announceData.Timestamp}}); err != nil {
 			logger.Warn("Error in upserting a valenode entry", "AnnounceData", announceData.String(), "error", err)
 			return err
 		}
@@ -315,7 +378,7 @@ func (sb *Backend) handleIstAnnounce(payload []byte) error {
 }
 
 func (sb *Backend) regossipIstAnnounce(msg *istanbul.Message, payload []byte, announceData announceData, regAndActiveVals map[common.Address]bool, destAddresses []string) error {
-	logger := sb.logger.New("func", "regossipIstAnnounce", "msgAddress", msg.Address, "msg_round", announceData.View.Round, "msg_seq", announceData.View.Sequence)
+	logger := sb.logger.New("func", "regossipIstAnnounce", "msgAddress", msg.Address, "msg_timestamp", announceData.Timestamp)
 	// If we gossiped this address/enodeURL within the last 60 seconds and the enodeURLHash and destAddressHash didn't change, then don't regossip
 
 	// Generate the destAddresses hash

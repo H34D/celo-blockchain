@@ -17,6 +17,8 @@
 package core
 
 import (
+	"math/big"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
 )
@@ -35,10 +37,12 @@ func (c *core) handleRequest(request *istanbul.Request) error {
 
 	logger.Trace("handleRequest", "number", request.Proposal.Number(), "hash", request.Proposal.Hash())
 
-	c.current.SetPendingRequest(request)
+	if err = c.current.SetPendingRequest(request); err != nil {
+		return err
+	}
 
 	// Must go through startNewRound to send proposals for round > 0 to ensure a round change certificate is generated.
-	if c.state == StateAcceptRequest && c.current.Round().Cmp(common.Big0) == 0 {
+	if c.current.State() == StateAcceptRequest && c.current.Round().Cmp(common.Big0) == 0 {
 		c.sendPreprepare(request, istanbul.RoundChangeCertificate{})
 	}
 	return nil
@@ -62,8 +66,17 @@ func (c *core) checkRequestMsg(request *istanbul.Request) error {
 	}
 }
 
+var (
+	maxNumberForRequestsQueue = big.NewInt(2 << (63 - 2))
+)
+
 func (c *core) storeRequestMsg(request *istanbul.Request) {
 	logger := c.newLogger("func", "storeRequestMsg")
+
+	if request.Proposal.Number().Cmp(maxNumberForRequestsQueue) >= 0 {
+		logger.Debug("Dropping future request", "number", request.Proposal.Number(), "hash", request.Proposal.Hash())
+		return
+	}
 
 	logger.Trace("Store future request", "number", request.Proposal.Number(), "hash", request.Proposal.Hash())
 
@@ -81,7 +94,7 @@ func (c *core) processPendingRequests() {
 		m, prio := c.pendingRequests.Pop()
 		r, ok := m.(*istanbul.Request)
 		if !ok {
-			c.logger.Warn("Malformed request, skip", "msg", m)
+			c.logger.Warn("Malformed request, skip", "m", m)
 			continue
 		}
 

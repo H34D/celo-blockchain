@@ -18,6 +18,8 @@ package backend
 
 import (
 	"errors"
+	"fmt"
+	blscrypto "github.com/ethereum/go-ethereum/crypto/bls"
 	"math/big"
 	"sync"
 	"time"
@@ -30,6 +32,7 @@ import (
 	istanbulCore "github.com/ethereum/go-ethereum/consensus/istanbul/core"
 	"github.com/ethereum/go-ethereum/consensus/istanbul/validator"
 	"github.com/ethereum/go-ethereum/contract_comm/election"
+	comm_errors "github.com/ethereum/go-ethereum/contract_comm/errors"
 	"github.com/ethereum/go-ethereum/contract_comm/random"
 	"github.com/ethereum/go-ethereum/contract_comm/validators"
 	"github.com/ethereum/go-ethereum/core"
@@ -39,6 +42,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -100,22 +104,33 @@ func New(config *istanbul.Config, db ethdb.Database) consensus.Istanbul {
 		logger.Crit("Failed to create known messages cache", "err", err)
 	}
 	backend := &Backend{
-		config:               config,
-		istanbulEventMux:     new(event.TypeMux),
-		logger:               logger,
-		db:                   db,
-		commitCh:             make(chan *types.Block, 1),
-		recentSnapshots:      recentSnapshots,
-		coreStarted:          false,
-		recentMessages:       recentMessages,
-		knownMessages:        knownMessages,
-		announceWg:           new(sync.WaitGroup),
-		announceQuit:         make(chan struct{}),
-		lastAnnounceGossiped: make(map[common.Address]*AnnounceGossipTimestamp),
-		valEnodesShareWg:     new(sync.WaitGroup),
-		valEnodesShareQuit:   make(chan struct{}),
+		config:                  config,
+		istanbulEventMux:        new(event.TypeMux),
+		logger:                  logger,
+		db:                      db,
+		commitCh:                make(chan *types.Block, 1),
+		recentSnapshots:         recentSnapshots,
+		coreStarted:             false,
+		recentMessages:          recentMessages,
+		knownMessages:           knownMessages,
+		announceWg:              new(sync.WaitGroup),
+		announceQuit:            make(chan struct{}),
+		lastAnnounceGossiped:    make(map[common.Address]*AnnounceGossipTimestamp),
+		valEnodesShareWg:        new(sync.WaitGroup),
+		valEnodesShareQuit:      make(chan struct{}),
+		finalizationTimer:       metrics.NewRegisteredTimer("consensus/istanbul/backend/finalize", nil),
+		rewardDistributionTimer: metrics.NewRegisteredTimer("consensus/istanbul/backend/rewards", nil),
 	}
 	backend.core = istanbulCore.New(backend, backend.config)
+
+	backend.logger = istanbul.NewIstLogger(
+		func() *big.Int {
+			if backend.core != nil && backend.core.CurrentView() != nil {
+				return backend.core.CurrentView().Round
+			}
+			return common.Big0
+		},
+	)
 
 	vph := &validatorPeerHandler{sb: backend}
 	table, err := enodes.OpenValidatorEnodeDB(config.ValidatorEnodeDBPath, vph)
@@ -135,7 +150,7 @@ type Backend struct {
 
 	address          common.Address           // Ethereum address of the signing key
 	signFn           istanbul.SignerFn        // Signer function to authorize hashes with
-	signHashBLSFn    istanbul.SignerFn        // Signer function to authorize hashes using BLS with
+	signHashBLSFn    istanbul.BLSSignerFn     // Signer function to authorize hashes using BLS with
 	signMessageBLSFn istanbul.MessageSignerFn // Signer function to authorize messages using BLS with
 	signFnMu         sync.RWMutex             // Protects the signer fields
 
@@ -189,6 +204,11 @@ type Backend struct {
 
 	delegateSignFeed  event.Feed
 	delegateSignScope event.SubscriptionScope
+
+	// Metric timer used to record block finalization times.
+	finalizationTimer metrics.Timer
+	// Metric timer used to record epoch reward distribution times.
+	rewardDistributionTimer metrics.Timer
 }
 
 func (sb *Backend) IsProxy() bool {
@@ -196,7 +216,7 @@ func (sb *Backend) IsProxy() bool {
 }
 
 func (sb *Backend) IsProxiedValidator() bool {
-	return sb.proxyNode != nil
+	return sb.proxyNode != nil && sb.proxyNode.peer != nil
 }
 
 // SendDelegateSignMsgToProxy sends an istanbulDelegateSign message to a proxy
@@ -222,7 +242,7 @@ func (sb *Backend) SendDelegateSignMsgToProxiedValidator(msg []byte) error {
 }
 
 // Authorize implements istanbul.Backend.Authorize
-func (sb *Backend) Authorize(address common.Address, signFn istanbul.SignerFn, signHashBLSFn istanbul.SignerFn, signMessageBLSFn istanbul.MessageSignerFn) {
+func (sb *Backend) Authorize(address common.Address, signFn istanbul.SignerFn, signHashBLSFn istanbul.BLSSignerFn, signMessageBLSFn istanbul.MessageSignerFn) {
 	sb.signFnMu.Lock()
 	defer sb.signFnMu.Unlock()
 
@@ -249,9 +269,41 @@ func (sb *Backend) Validators(proposal istanbul.Proposal) istanbul.ValidatorSet 
 	return sb.getOrderedValidators(proposal.Number().Uint64(), proposal.Hash())
 }
 
-// ParentBlockValidators implements istanbul.Backend.GetParentValidators
+// ParentBlockValidators implements istanbul.Backend.ParentBlockValidators
 func (sb *Backend) ParentBlockValidators(proposal istanbul.Proposal) istanbul.ValidatorSet {
 	return sb.getOrderedValidators(proposal.Number().Uint64()-1, proposal.ParentHash())
+}
+
+func (sb *Backend) NextBlockValidators(proposal istanbul.Proposal) (istanbul.ValidatorSet, error) {
+	istExtra, err := types.ExtractIstanbulExtra(proposal.Header())
+	if err != nil {
+		return nil, err
+	}
+
+	// There was no change
+	if len(istExtra.AddedValidators) == 0 && istExtra.RemovedValidators.BitLen() == 0 {
+		return sb.ParentBlockValidators(proposal), nil
+	}
+
+	snap, err := sb.snapshot(sb.chain, proposal.Number().Uint64()-1, common.Hash{}, nil)
+	if err != nil {
+		return nil, err
+	}
+	snap = snap.copy()
+
+	addedValidators, err := istanbul.CombineIstanbulExtraToValidatorData(istExtra.AddedValidators, istExtra.AddedValidatorsPublicKeys)
+	if err != nil {
+		return nil, err
+	}
+
+	if !snap.ValSet.RemoveValidators(istExtra.RemovedValidators) {
+		return nil, fmt.Errorf("could not obtain next block validators: failed at remove validators")
+	}
+	if !snap.ValSet.AddValidators(addedValidators) {
+		return nil, fmt.Errorf("could not obtain next block validators: failed at add validators")
+	}
+
+	return snap.ValSet, nil
 }
 
 func (sb *Backend) GetValidators(blockNumber *big.Int, headerHash common.Hash) []istanbul.Validator {
@@ -336,9 +388,9 @@ func (sb *Backend) Gossip(destAddresses []common.Address, payload []byte, ethMsg
 	}
 
 	if len(peers) > 0 {
-		for addr, p := range peers {
+		for nodeID, p := range peers {
 			if !ignoreCache {
-				ms, ok := sb.recentMessages.Get(addr)
+				ms, ok := sb.recentMessages.Get(nodeID)
 				var m *lru.ARCCache
 				if ok {
 					m, _ = ms.(*lru.ARCCache)
@@ -351,9 +403,9 @@ func (sb *Backend) Gossip(destAddresses []common.Address, payload []byte, ethMsg
 				}
 
 				m.Add(hash, true)
-				sb.recentMessages.Add(addr, m)
+				sb.recentMessages.Add(nodeID, m)
 			}
-			sb.logger.Trace("Sending istanbul message to peer", "msg_code", ethMsgCode, "address", addr)
+			sb.logger.Trace("Sending istanbul message to peer", "msg_code", ethMsgCode, "nodeID", nodeID)
 
 			go p.Send(ethMsgCode, payload)
 		}
@@ -362,7 +414,7 @@ func (sb *Backend) Gossip(destAddresses []common.Address, payload []byte, ethMsg
 }
 
 // Commit implements istanbul.Backend.Commit
-func (sb *Backend) Commit(proposal istanbul.Proposal, aggregatedSeal types.IstanbulAggregatedSeal) error {
+func (sb *Backend) Commit(proposal istanbul.Proposal, aggregatedSeal types.IstanbulAggregatedSeal, aggregatedEpochValidatorSetSeal types.IstanbulEpochValidatorSetSeal) error {
 	// Check if the proposal is a valid block
 	block := &types.Block{}
 	block, ok := proposal.(*types.Block)
@@ -379,6 +431,9 @@ func (sb *Backend) Commit(proposal istanbul.Proposal, aggregatedSeal types.Istan
 	}
 	// update block's header
 	block = block.WithSeal(h)
+	block = block.WithEpochSnarkData(&types.EpochSnarkData{
+		Signature: aggregatedEpochValidatorSetSeal.Signature,
+	})
 
 	sb.logger.Info("Committed", "address", sb.Address(), "round", aggregatedSeal.Round.Uint64(), "hash", proposal.Hash(), "number", proposal.Number().Uint64())
 	// - if the proposed and committed blocks are the same, send the proposed hash
@@ -441,7 +496,7 @@ func (sb *Backend) Verify(proposal istanbul.Proposal) (time.Duration, error) {
 
 	err = sb.VerifyHeader(sb.chain, block.Header(), false)
 
-	// ignore errEmptyCommittedSeals error because we don't have the committed seals yet
+	// ignore errEmptyAggregatedSeal error because we don't have the committed seals yet
 	if err != nil && err != errEmptyAggregatedSeal {
 		if err == consensus.ErrFutureBlock {
 			return time.Unix(block.Header().Time.Int64(), 0).Sub(now()), consensus.ErrFutureBlock
@@ -454,7 +509,7 @@ func (sb *Backend) Verify(proposal istanbul.Proposal) (time.Duration, error) {
 	// Get the state from this block's parent.
 	state, err := sb.stateAt(block.Header().ParentHash)
 	if err != nil {
-		log.Error("verify - Error in getting the block's parent's state", "parentHash", block.Header().ParentHash.Hex(), "err", err)
+		sb.logger.Error("verify - Error in getting the block's parent's state", "parentHash", block.Header().ParentHash.Hex(), "err", err)
 		return 0, err
 	}
 
@@ -464,20 +519,20 @@ func (sb *Backend) Verify(proposal istanbul.Proposal) (time.Duration, error) {
 	// Apply this block's transactions to update the state
 	receipts, _, usedGas, err := sb.processBlock(block, state)
 	if err != nil {
-		log.Error("verify - Error in processing the block", "err", err)
+		sb.logger.Error("verify - Error in processing the block", "err", err)
 		return 0, err
 	}
 
 	// Validate the block
 	if err := sb.validateState(block, state, receipts, usedGas); err != nil {
-		log.Error("verify - Error in validating the block", "err", err)
+		sb.logger.Error("verify - Error in validating the block", "err", err)
 		return 0, err
 	}
 
 	// verify the validator set diff if this is the last block of the epoch
 	if istanbul.IsLastBlockOfEpoch(block.Header().Number.Uint64(), sb.config.Epoch) {
 		if err := sb.verifyValSetDiff(proposal, block, state); err != nil {
-			log.Error("verify - Error in verifying the val set diff", "err", err)
+			sb.logger.Error("verify - Error in verifying the val set diff", "err", err)
 			return 0, err
 		}
 	}
@@ -506,7 +561,7 @@ func (sb *Backend) verifyValSetDiff(proposal istanbul.Proposal, block *types.Blo
 	newValSet, err := sb.getNewValidatorSet(block.Header(), state)
 	if err != nil {
 		if len(istExtra.AddedValidators) != 0 || istExtra.RemovedValidators.BitLen() != 0 {
-			log.Error("verifyValSetDiff - Invalid val set diff.  Non empty diff when it should be empty.", "addedValidators", common.ConvertToStringSlice(istExtra.AddedValidators), "removedValidators", istExtra.RemovedValidators.Text(16))
+			sb.logger.Error("verifyValSetDiff - Invalid val set diff.  Non empty diff when it should be empty.", "addedValidators", common.ConvertToStringSlice(istExtra.AddedValidators), "removedValidators", istExtra.RemovedValidators.Text(16))
 			return errInvalidValidatorSetDiff
 		}
 	} else {
@@ -523,14 +578,14 @@ func (sb *Backend) verifyValSetDiff(proposal istanbul.Proposal, block *types.Blo
 		addedValidators, removedValidators := istanbul.ValidatorSetDiff(oldValSet, newValSet)
 
 		addedValidatorsAddresses := make([]common.Address, 0, len(addedValidators))
-		addedValidatorsPublicKeys := make([][]byte, 0, len(addedValidators))
+		addedValidatorsPublicKeys := make([]blscrypto.SerializedPublicKey, 0, len(addedValidators))
 		for _, val := range addedValidators {
 			addedValidatorsAddresses = append(addedValidatorsAddresses, val.Address)
 			addedValidatorsPublicKeys = append(addedValidatorsPublicKeys, val.BLSPublicKey)
 		}
 
 		if !istanbul.CompareValidatorSlices(addedValidatorsAddresses, istExtra.AddedValidators) || removedValidators.Cmp(istExtra.RemovedValidators) != 0 || !istanbul.CompareValidatorPublicKeySlices(addedValidatorsPublicKeys, istExtra.AddedValidatorsPublicKeys) {
-			log.Error("verifyValSetDiff - Invalid val set diff. Comparison failed. ", "got addedValidators", common.ConvertToStringSlice(istExtra.AddedValidators), "got removedValidators", istExtra.RemovedValidators.Text(16), "got addedValidatorsPublicKeys", istanbul.ConvertPublicKeysToStringSlice(istExtra.AddedValidatorsPublicKeys), "expected addedValidators", common.ConvertToStringSlice(addedValidatorsAddresses), "expected removedValidators", removedValidators.Text(16), "expected addedValidatorsPublicKeys", istanbul.ConvertPublicKeysToStringSlice(addedValidatorsPublicKeys))
+			sb.logger.Error("verifyValSetDiff - Invalid val set diff. Comparison failed. ", "got addedValidators", common.ConvertToStringSlice(istExtra.AddedValidators), "got removedValidators", istExtra.RemovedValidators.Text(16), "got addedValidatorsPublicKeys", istanbul.ConvertPublicKeysToStringSlice(istExtra.AddedValidatorsPublicKeys), "expected addedValidators", common.ConvertToStringSlice(addedValidatorsAddresses), "expected removedValidators", removedValidators.Text(16), "expected addedValidatorsPublicKeys", istanbul.ConvertPublicKeysToStringSlice(addedValidatorsPublicKeys))
 			return errInvalidValidatorSetDiff
 		}
 	}
@@ -549,20 +604,33 @@ func (sb *Backend) Sign(data []byte) ([]byte, error) {
 	return sb.signFn(accounts.Account{Address: sb.address}, hashData)
 }
 
-func (sb *Backend) SignBlockHeader(data []byte) ([]byte, error) {
+func (sb *Backend) SignBlockHeader(data []byte) (blscrypto.SerializedSignature, error) {
 	if sb.signHashBLSFn == nil {
-		return nil, errInvalidSigningFn
+		return blscrypto.SerializedSignature{}, errInvalidSigningFn
 	}
 	sb.signFnMu.RLock()
 	defer sb.signFnMu.RUnlock()
 	return sb.signHashBLSFn(accounts.Account{Address: sb.address}, data)
 }
 
+func (sb *Backend) SignBLSWithCompositeHash(data []byte) (blscrypto.SerializedSignature, error) {
+	if sb.signMessageBLSFn == nil {
+		return blscrypto.SerializedSignature{}, errInvalidSigningFn
+	}
+	sb.signFnMu.RLock()
+	defer sb.signFnMu.RUnlock()
+	// Currently, ExtraData is unused. In the future, it could include data that could be used to introduce
+	// "firmware-level" protection. Such data could include data that the SNARK doesn't necessarily need,
+	// such as the block number, which can be used by a hardware wallet to see that the block number
+	// is incrementing, without having to perform the two-level hashing, just one-level fast hashing.
+	return sb.signMessageBLSFn(accounts.Account{Address: sb.address}, data, []byte{})
+}
+
 // CheckSignature implements istanbul.Backend.CheckSignature
 func (sb *Backend) CheckSignature(data []byte, address common.Address, sig []byte) error {
 	signer, err := istanbul.GetSignatureAddress(data, sig)
 	if err != nil {
-		log.Error("Failed to get signer address", "err", err)
+		sb.logger.Error("Failed to get signer address", "err", err)
 		return err
 	}
 	// Compare derived addresses
@@ -590,7 +658,7 @@ func (sb *Backend) getValidators(number uint64, hash common.Hash) istanbul.Valid
 	snap, err := sb.snapshot(sb.chain, number, hash, nil)
 	if err != nil {
 		sb.logger.Warn("Error getting snapshot", "number", number, "hash", hash, "err", err)
-		return validator.NewSet(nil, sb.config.ProposerPolicy)
+		return validator.NewSet(nil)
 	}
 	return snap.ValSet
 }
@@ -618,10 +686,14 @@ func (sb *Backend) getOrderedValidators(number uint64, hash common.Hash) istanbu
 		return valSet
 	}
 
-	if valSet.Policy() == istanbul.ShuffledRoundRobin {
+	if sb.config.ProposerPolicy == istanbul.ShuffledRoundRobin {
 		seed, err := sb.validatorRandomnessAtBlockNumber(number, hash)
 		if err != nil {
-			sb.logger.Error("Failed to set randomness for proposer selection", "block_number", number, "hash", hash, "error", err)
+			if err == comm_errors.ErrRegistryContractNotDeployed {
+				sb.logger.Debug("Failed to set randomness for proposer selection", "block_number", number, "hash", hash, "error", err)
+			} else {
+				sb.logger.Warn("Failed to set randomness for proposer selection", "block_number", number, "hash", hash, "error", err)
+			}
 		}
 		valSet.SetRandomness(seed)
 	}
@@ -711,4 +783,14 @@ func (sb *Backend) ValidatorAddress() common.Address {
 		localAddress = sb.Address()
 	}
 	return localAddress
+}
+
+func (sb *Backend) ConnectToVals() {
+	// If this is a proxy, then refresh the val peers.  Note that this will be done within Backend.Start
+	// for non proxied validators
+	if sb.config.Proxy {
+		headBlock := sb.GetCurrentHeadBlock()
+		valset := sb.getValidators(headBlock.Number().Uint64(), headBlock.Hash())
+		sb.RefreshValPeers(valset)
+	}
 }
