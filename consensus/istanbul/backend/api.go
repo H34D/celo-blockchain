@@ -17,10 +17,17 @@
 package backend
 
 import (
+	"errors"
+	"fmt"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
+	vet "github.com/ethereum/go-ethereum/consensus/istanbul/backend/internal/enodes"
+	"github.com/ethereum/go-ethereum/consensus/istanbul/core"
+	"github.com/ethereum/go-ethereum/consensus/istanbul/validator"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -28,6 +35,32 @@ import (
 type API struct {
 	chain    consensus.ChainReader
 	istanbul *Backend
+}
+
+// getHeaderByNumber retrieves the header requested block or current if unspecified.
+func (api *API) getParentHeaderByNumber(number *rpc.BlockNumber) (*types.Header, error) {
+	var parent uint64
+	if number == nil || *number == rpc.LatestBlockNumber || *number == rpc.PendingBlockNumber {
+		head := api.chain.CurrentHeader()
+		if head == nil {
+			return nil, errUnknownBlock
+		}
+		if number == nil || *number == rpc.LatestBlockNumber {
+			parent = head.Number.Uint64() - 1
+		} else {
+			parent = head.Number.Uint64()
+		}
+	} else if *number == rpc.EarliestBlockNumber {
+		return nil, errUnknownBlock
+	} else {
+		parent = uint64(*number - 1)
+	}
+
+	header := api.chain.GetHeaderByNumber(parent)
+	if header == nil {
+		return nil, errUnknownBlock
+	}
+	return header, nil
 }
 
 // GetSnapshot retrieves the state snapshot at a given block.
@@ -46,48 +79,102 @@ func (api *API) GetSnapshot(number *rpc.BlockNumber) (*Snapshot, error) {
 	return api.istanbul.snapshot(api.chain, header.Number.Uint64(), header.Hash(), nil)
 }
 
-// GetSnapshotAtHash retrieves the state snapshot at a given block.
-func (api *API) GetSnapshotAtHash(hash common.Hash) (*Snapshot, error) {
-	header := api.chain.GetHeaderByHash(hash)
-	if header == nil {
-		return nil, errUnknownBlock
-	}
-	return api.istanbul.snapshot(api.chain, header.Number.Uint64(), header.Hash(), nil)
-}
-
-// GetValidators retrieves the list of authorized validators at the specified block.
+// GetValidators retrieves the list validators that must sign a given block.
 func (api *API) GetValidators(number *rpc.BlockNumber) ([]common.Address, error) {
-	// Retrieve the requested block number (or current if none requested)
-	var header *types.Header
-	if number == nil || *number == rpc.LatestBlockNumber {
-		header = api.chain.CurrentHeader()
-	} else {
-		header = api.chain.GetHeaderByNumber(uint64(number.Int64()))
-	}
-	// Ensure we have an actually valid block and return the validators from its snapshot
-	if header == nil {
-		return nil, errUnknownBlock
-	}
-	snap, err := api.istanbul.snapshot(api.chain, header.Number.Uint64(), header.Hash(), nil)
+	header, err := api.getParentHeaderByNumber(number)
 	if err != nil {
 		return nil, err
 	}
-	validators := snap.validators()
-	validatorsAddresses, _ := istanbul.SeparateValidatorDataIntoIstanbulExtra(validators)
-	return validatorsAddresses, nil
+	validators := api.istanbul.GetValidators(header.Number, header.Hash())
+	return istanbul.MapValidatorsToAddresses(validators), nil
 }
 
-// GetValidatorsAtHash retrieves the state snapshot at a given block.
-func (api *API) GetValidatorsAtHash(hash common.Hash) ([]common.Address, error) {
-	header := api.chain.GetHeaderByHash(hash)
-	if header == nil {
-		return nil, errUnknownBlock
-	}
-	snap, err := api.istanbul.snapshot(api.chain, header.Number.Uint64(), header.Hash(), nil)
+// GetProposer retrieves the proposer for a given block number (i.e. sequence) and round.
+func (api *API) GetProposer(sequence *rpc.BlockNumber, round *uint64) (common.Address, error) {
+	header, err := api.getParentHeaderByNumber(sequence)
 	if err != nil {
-		return nil, err
+		return common.Address{}, err
 	}
-	validators := snap.validators()
-	validatorsAddresses, _ := istanbul.SeparateValidatorDataIntoIstanbulExtra(validators)
-	return validatorsAddresses, nil
+
+	valSet := api.istanbul.getOrderedValidators(header.Number.Uint64(), header.Hash())
+	if valSet == nil {
+		return common.Address{}, err
+	}
+	previousProposer, err := api.istanbul.Author(header)
+	if err != nil {
+		return common.Address{}, err
+	}
+	if round == nil {
+		round = new(uint64)
+	}
+	proposer := validator.GetProposerSelector(api.istanbul.config.ProposerPolicy)(valSet, previousProposer, *round)
+	return proposer.Address(), nil
 }
+
+// AddProxy peers with a remote node that acts as a proxy, even if slots are full
+func (api *API) AddProxy(url, externalUrl string) (bool, error) {
+	if !api.istanbul.config.Proxied {
+		api.istanbul.logger.Error("Add proxy node failed: this node is not configured to be proxied")
+		return false, errors.New("Can't add proxy for node that is not configured to be proxied")
+	}
+
+	node, err := enode.ParseV4(url)
+	if err != nil {
+		return false, fmt.Errorf("invalid enode: %v", err)
+	}
+
+	externalNode, err := enode.ParseV4(externalUrl)
+	if err != nil {
+		return false, fmt.Errorf("invalid external enode: %v", err)
+	}
+
+	err = api.istanbul.addProxy(node, externalNode)
+	return true, err
+}
+
+// RemoveProxy removes a node from acting as a proxy
+func (api *API) RemoveProxy(url string) (bool, error) {
+	// Try to remove the url as a proxy and return
+	node, err := enode.ParseV4(url)
+	if err != nil {
+		return false, fmt.Errorf("invalid enode: %v", err)
+	}
+	api.istanbul.removeProxy(node)
+	return true, nil
+}
+
+// Retrieve the Validator Enode Table
+func (api *API) GetValEnodeTable() (map[string]*vet.ValEnodeEntryInfo, error) {
+	return api.istanbul.valEnodeTable.ValEnodeTableInfo()
+}
+
+func (api *API) GetVersionCertificateTableInfo() (map[string]*vet.VersionCertificateEntryInfo, error) {
+	return api.istanbul.versionCertificateTable.Info()
+}
+
+// GetCurrentRoundState retrieves the current IBFT RoundState
+func (api *API) GetCurrentRoundState() (*core.RoundStateSummary, error) {
+	if !api.istanbul.coreStarted {
+		return nil, istanbul.ErrStoppedEngine
+	}
+	return api.istanbul.core.CurrentRoundState().Summary(), nil
+}
+
+// GetCurrentRoundState retrieves the current IBFT RoundState
+func (api *API) ForceRoundChange() (bool, error) {
+	if !api.istanbul.coreStarted {
+		return false, istanbul.ErrStoppedEngine
+	}
+	api.istanbul.core.ForceRoundChange()
+	return true, nil
+}
+
+// TODO(kevjue) - implement this
+// ProxyInfo retrieves all the information we know about each individual proxy node
+/* func (api *PublicAdminAPI) ProxyInfo() ([]*p2p.PeerInfo, error) {
+	server := api.node.Server()
+	if server == nil {
+		return nil, ErrNodeStopped
+	}
+	return server.ProxyInfo(), nil
+} */

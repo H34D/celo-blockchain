@@ -21,10 +21,12 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/rlp"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/crypto/bls"
+	blscrypto "github.com/ethereum/go-ethereum/crypto/bls"
 )
 
 var (
@@ -33,15 +35,14 @@ var (
 )
 
 func TestValidatorSet(t *testing.T) {
-	testNewValidatorSet(t)
-	testNormalValSet(t)
-	testEmptyValSet(t)
-	testAddAndRemoveValidator(t)
-	testQuorumSizes(t)
+	t.Run("NewValidatorSet", testNewValidatorSet)
+	t.Run("NormalValSet", testNormalValSet)
+	t.Run("EmptyValSet", testEmptyValSet)
+	t.Run("AddAndRemoveValidator", testAddAndRemoveValidator)
+	t.Run("QuorumSizes", testQuorumSizes)
 }
 
 func testNewValidatorSet(t *testing.T) {
-	var validators []istanbul.Validator
 	const ValCnt = 100
 
 	// Create 100 validators with random addresses
@@ -52,13 +53,12 @@ func testNewValidatorSet(t *testing.T) {
 		blsPublicKey, _ := blscrypto.PrivateToPublic(blsPrivateKey)
 		addr := crypto.PubkeyToAddress(key.PublicKey)
 		val := New(addr, blsPublicKey)
-		validators = append(validators, val)
 		b = append(b, val.Address().Bytes()...)
-		b = append(b, blsPublicKey...)
+		b = append(b, blsPublicKey[:]...)
 	}
 
 	// Create ValidatorSet
-	valSet := NewSet(ExtractValidators(b), istanbul.RoundRobin)
+	valSet := NewSet(ExtractValidators(b))
 	if valSet == nil {
 		t.Errorf("the validator byte array cannot be parsed")
 		t.FailNow()
@@ -70,11 +70,11 @@ func testNormalValSet(t *testing.T) {
 	b2 := common.Hex2Bytes(testAddress2)
 	addr1 := common.BytesToAddress(b1)
 	addr2 := common.BytesToAddress(b2)
-	val1 := New(addr1, []byte{})
-	val2 := New(addr2, []byte{})
+	val1 := New(addr1, blscrypto.SerializedPublicKey{})
+	val2 := New(addr2, blscrypto.SerializedPublicKey{})
 
-	validators, _ := istanbul.CombineIstanbulExtraToValidatorData([]common.Address{addr1, addr2}, [][]byte{{}, {}})
-	valSet := newDefaultSet(validators, istanbul.RoundRobin)
+	validators, _ := istanbul.CombineIstanbulExtraToValidatorData([]common.Address{addr1, addr2}, []blscrypto.SerializedPublicKey{{}, {}})
+	valSet := newDefaultSet(validators)
 	if valSet == nil {
 		t.Errorf("the format of validator set is invalid")
 		t.FailNow()
@@ -104,19 +104,19 @@ func testNormalValSet(t *testing.T) {
 }
 
 func testEmptyValSet(t *testing.T) {
-	valSet := NewSet(ExtractValidators([]byte{}), istanbul.RoundRobin)
+	valSet := NewSet(ExtractValidators([]byte{}))
 	if valSet == nil {
 		t.Errorf("validator set should not be nil")
 	}
 }
 
 func testAddAndRemoveValidator(t *testing.T) {
-	valSet := NewSet(ExtractValidators([]byte{}), istanbul.RoundRobin)
+	valSet := NewSet(ExtractValidators([]byte{}))
 	if !valSet.AddValidators(
 		[]istanbul.ValidatorData{
 			{
-				common.BytesToAddress([]byte(string(3))),
-				[]byte{},
+				Address:      common.BytesToAddress([]byte(string(3))),
+				BLSPublicKey: blscrypto.SerializedPublicKey{},
 			},
 		},
 	) {
@@ -125,8 +125,8 @@ func testAddAndRemoveValidator(t *testing.T) {
 	if valSet.AddValidators(
 		[]istanbul.ValidatorData{
 			{
-				common.BytesToAddress([]byte(string(3))),
-				[]byte{},
+				Address:      common.BytesToAddress([]byte(string(3))),
+				BLSPublicKey: blscrypto.SerializedPublicKey{},
 			},
 		},
 	) {
@@ -135,12 +135,12 @@ func testAddAndRemoveValidator(t *testing.T) {
 	valSet.AddValidators(
 		[]istanbul.ValidatorData{
 			{
-				common.BytesToAddress([]byte(string(2))),
-				[]byte{},
+				Address:      common.BytesToAddress([]byte(string(2))),
+				BLSPublicKey: blscrypto.SerializedPublicKey{},
 			},
 			{
-				common.BytesToAddress([]byte(string(1))),
-				[]byte{},
+				Address:      common.BytesToAddress([]byte(string(1))),
+				BLSPublicKey: blscrypto.SerializedPublicKey{},
 			},
 		},
 	)
@@ -159,18 +159,16 @@ func testAddAndRemoveValidator(t *testing.T) {
 	if !valSet.RemoveValidators(big.NewInt(1)) { // remove first falidator
 		t.Error("the validator should be removed")
 	}
-	if valSet.RemoveValidators(big.NewInt(1)) {
-		t.Error("the non-existing validator should not be removed")
-	}
-	if len(valSet.List()) != 3 || len(valSet.List()) != valSet.PaddedSize() || valSet.Size() != 2 { // validators set should have the same padded size but reduced size
+
+	if len(valSet.List()) != 2 || len(valSet.List()) != valSet.Size() { // validators set should have the same size
 		t.Error("the size of validator set should be 2")
 	}
-	valSet.RemoveValidators(big.NewInt(2))                                                          // remove second validator
-	if len(valSet.List()) != 3 || len(valSet.List()) != valSet.PaddedSize() || valSet.Size() != 1 { // validators set should have the same padded size but reduced size
+	valSet.RemoveValidators(big.NewInt(2))                              // remove second validator
+	if len(valSet.List()) != 1 || len(valSet.List()) != valSet.Size() { // validators set should have the same size
 		t.Error("the size of validator set should be 1")
 	}
-	valSet.RemoveValidators(big.NewInt(4))                                                          // remove third validator
-	if len(valSet.List()) != 3 || len(valSet.List()) != valSet.PaddedSize() || valSet.Size() != 0 { // validators set should have the same padded size but reduced size
+	valSet.RemoveValidators(big.NewInt(1))                              // remove third validator
+	if len(valSet.List()) != 0 || len(valSet.List()) != valSet.Size() { // validators set should have the same size
 		t.Error("the size of validator set should be 0")
 	}
 }
@@ -183,8 +181,8 @@ func generateValidators(n int) ([]istanbul.ValidatorData, [][]byte) {
 		blsPrivateKey, _ := blscrypto.ECDSAToBLS(privateKey)
 		blsPublicKey, _ := blscrypto.PrivateToPublic(blsPrivateKey)
 		vals = append(vals, istanbul.ValidatorData{
-			crypto.PubkeyToAddress(privateKey.PublicKey),
-			blsPublicKey,
+			Address:      crypto.PubkeyToAddress(privateKey.PublicKey),
+			BLSPublicKey: blsPublicKey,
 		})
 		keys = append(keys, blsPrivateKey)
 	}
@@ -207,10 +205,51 @@ func testQuorumSizes(t *testing.T) {
 
 	for _, testCase := range testCases {
 		vals, _ := generateValidators(testCase.validatorSetSize)
-		valSet := newDefaultSet(vals, istanbul.RoundRobin)
+		valSet := newDefaultSet(vals)
 
 		if valSet.MinQuorumSize() != testCase.expectedMinQuorumSize {
 			t.Errorf("error mismatch quorum size for valset of size %d: have %d, want %d", valSet.Size(), valSet.MinQuorumSize(), testCase.expectedMinQuorumSize)
 		}
+	}
+}
+
+func TestValidatorRLPEncoding(t *testing.T) {
+
+	val := New(common.BytesToAddress([]byte(string(2))), blscrypto.SerializedPublicKey{1, 2, 3})
+
+	rawVal, err := rlp.EncodeToBytes(val)
+	if err != nil {
+		t.Errorf("Error %v", err)
+	}
+
+	var result *defaultValidator
+	if err = rlp.DecodeBytes(rawVal, &result); err != nil {
+		t.Errorf("Error %v", err)
+	}
+
+	if !reflect.DeepEqual(val, result) {
+		t.Errorf("validator mismatch: have %v, want %v", val, result)
+	}
+}
+
+func TestValidatorSetRLPEncoding(t *testing.T) {
+
+	valSet := NewSet([]istanbul.ValidatorData{
+		{Address: common.BytesToAddress([]byte(string(2))), BLSPublicKey: blscrypto.SerializedPublicKey{1, 2, 3}},
+		{Address: common.BytesToAddress([]byte(string(4))), BLSPublicKey: blscrypto.SerializedPublicKey{3, 1, 4}},
+	})
+
+	rawVal, err := rlp.EncodeToBytes(valSet)
+	if err != nil {
+		t.Errorf("Error %v", err)
+	}
+
+	var result *defaultSet
+	if err = rlp.DecodeBytes(rawVal, &result); err != nil {
+		t.Errorf("Error %v", err)
+	}
+
+	if !reflect.DeepEqual(valSet, result) {
+		t.Errorf("validatorSet mismatch: have %v, want %v", valSet, result)
 	}
 }

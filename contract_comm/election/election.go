@@ -98,10 +98,55 @@ const electionABIString string = `[
         {
           "name": "maxTotalRewards",
           "type": "uint256"
+        },
+        {
+          "name": "uptimes",
+          "type": "uint256[]"
         }
       ],
       "name": "getGroupEpochRewards",
       "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "payable": false,
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "constant": true,
+      "inputs": [
+        {
+          "name": "minElectableValidators",
+          "type": "uint256"
+        },
+        {
+          "name": "maxElectableValidators",
+          "type": "uint256"
+        }
+      ],
+      "name": "electNValidatorSigners",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address[]"
+        }
+      ],
+      "payable": false,
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "constant": true,
+      "inputs": [],
+      "name": "getElectableValidators",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        },
         {
           "name": "",
           "type": "uint256"
@@ -125,6 +170,27 @@ func GetElectedValidators(header *types.Header, state vm.StateDB) ([]common.Addr
 	return newValSet, nil
 }
 
+func ElectNValidatorSigners(header *types.Header, state vm.StateDB, additionalAboveMaxElectable int64) ([]common.Address, error) {
+	var minElectableValidators *big.Int
+	var maxElectableValidators *big.Int
+
+	// Get the electable min and max
+	_, err := contract_comm.MakeStaticCall(params.ElectionRegistryId, electionABI, "getElectableValidators", []interface{}{}, &[]interface{}{&minElectableValidators, &maxElectableValidators}, params.MaxGasForGetElectableValidators, header, state)
+	if err != nil {
+		return nil, err
+	}
+
+	var electedValidators []common.Address
+	// Run the validator election for up to maxElectable + getTotalVotesForEligibleValidatorGroup
+	_, err = contract_comm.MakeStaticCall(params.ElectionRegistryId, electionABI, "electNValidatorSigners", []interface{}{minElectableValidators, maxElectableValidators.Add(maxElectableValidators, big.NewInt(additionalAboveMaxElectable))}, &electedValidators, params.MaxGasForElectNValidatorSigners, header, state)
+	if err != nil {
+		return nil, err
+	}
+
+	return electedValidators, nil
+
+}
+
 type voteTotal struct {
 	Group common.Address
 	Value *big.Int
@@ -135,7 +201,7 @@ func getTotalVotesForEligibleValidatorGroups(header *types.Header, state vm.Stat
 	var values []*big.Int
 	_, err := contract_comm.MakeStaticCall(params.ElectionRegistryId, electionABI, "getTotalVotesForEligibleValidatorGroups", []interface{}{}, &[]interface{}{&groups, &values}, params.MaxGasForGetEligibleValidatorGroupsVoteTotals, header, state)
 	if err != nil {
-		log.Error("Error calling getTotalVotesForEligibleValidatorGroups", "err", err)
+		return nil, err
 	}
 
 	voteTotals := make([]voteTotal, len(groups))
@@ -147,16 +213,16 @@ func getTotalVotesForEligibleValidatorGroups(header *types.Header, state vm.Stat
 	return voteTotals, err
 }
 
-func getGroupEpochRewards(header *types.Header, state vm.StateDB, group common.Address, maxRewards *big.Int) (*big.Int, error) {
+func getGroupEpochRewards(header *types.Header, state vm.StateDB, group common.Address, maxRewards *big.Int, uptimes []*big.Int) (*big.Int, error) {
 	var groupEpochRewards *big.Int
-	_, err := contract_comm.MakeStaticCall(params.ElectionRegistryId, electionABI, "getGroupEpochRewards", []interface{}{group, maxRewards}, &groupEpochRewards, params.MaxGasForGetGroupEpochRewards, header, state)
+	_, err := contract_comm.MakeStaticCall(params.ElectionRegistryId, electionABI, "getGroupEpochRewards", []interface{}{group, maxRewards, uptimes}, &groupEpochRewards, params.MaxGasForGetGroupEpochRewards, header, state)
 	if err != nil {
 		return nil, err
 	}
 	return groupEpochRewards, nil
 }
 
-func DistributeEpochRewards(header *types.Header, state vm.StateDB, groups []common.Address, maxTotalRewards *big.Int) (*big.Int, error) {
+func DistributeEpochRewards(header *types.Header, state vm.StateDB, groups []common.Address, maxTotalRewards *big.Int, uptimes map[common.Address][]*big.Int) (*big.Int, error) {
 	totalRewards := big.NewInt(0)
 	voteTotals, err := getTotalVotesForEligibleValidatorGroups(header, state)
 	if err != nil {
@@ -165,11 +231,12 @@ func DistributeEpochRewards(header *types.Header, state vm.StateDB, groups []com
 
 	rewards := make([]*big.Int, len(groups))
 	for i, group := range groups {
-		reward, err := getGroupEpochRewards(header, state, group, maxTotalRewards)
+		reward, err := getGroupEpochRewards(header, state, group, maxTotalRewards, uptimes[group])
 		if err != nil {
 			return totalRewards, err
 		}
 		rewards[i] = reward
+		log.Debug("Reward for group voters", "reward", reward, "group", group.String())
 	}
 
 	for i, group := range groups {
@@ -181,19 +248,21 @@ func DistributeEpochRewards(header *types.Header, state vm.StateDB, groups []com
 			}
 		}
 
-		sort.Slice(voteTotals, func(j, k int) bool {
-			return voteTotals[j].Value.Cmp(voteTotals[k].Value) < 0
+		// Sorting in descending order is necessary to match the order on-chain.
+		// TODO: We could make this more efficient by only moving the newly vote member.
+		sort.SliceStable(voteTotals, func(j, k int) bool {
+			return voteTotals[j].Value.Cmp(voteTotals[k].Value) > 0
 		})
 
 		lesser := common.ZeroAddress
 		greater := common.ZeroAddress
-		for i, voteTotal := range voteTotals {
+		for j, voteTotal := range voteTotals {
 			if voteTotal.Group == group {
-				if i > 0 {
-					lesser = voteTotals[i-1].Group
+				if j > 0 {
+					greater = voteTotals[j-1].Group
 				}
-				if i+1 < len(voteTotals) {
-					greater = voteTotals[i+1].Group
+				if j+1 < len(voteTotals) {
+					lesser = voteTotals[j+1].Group
 				}
 				break
 			}

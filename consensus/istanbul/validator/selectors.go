@@ -17,36 +17,28 @@
 package validator
 
 import (
-	"encoding/binary"
-	"math/rand"
+	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
+	"github.com/ethereum/go-ethereum/consensus/istanbul/validator/random"
 )
 
 func proposerIndex(valSet istanbul.ValidatorSet, proposer common.Address) uint64 {
-	if idx := valSet.GetFilteredIndex(proposer); idx >= 0 {
+	if idx := valSet.GetIndex(proposer); idx >= 0 {
 		return uint64(idx)
 	}
 	return 0
 }
 
-// TODO: Pull ordering from smart contract and deprecate this function.
-func randFromHash(hash common.Hash) *rand.Rand {
-	// Reduce the hash to 64 bits to use as the seed.
-	var seed uint64
-	for i := 0; i < common.HashLength; i += 8 {
-		seed ^= binary.BigEndian.Uint64(hash[i : i+8])
-	}
-	return rand.New(rand.NewSource(int64(seed)))
-}
-
 // ShuffledRoundRobinProposer selects the next proposer with a round robin strategy according to a shuffled order.
-func ShuffledRoundRobinProposer(valSet istanbul.ValidatorSet, proposer common.Address, round uint64, seed common.Hash) istanbul.Validator {
+func ShuffledRoundRobinProposer(valSet istanbul.ValidatorSet, proposer common.Address, round uint64) istanbul.Validator {
 	if valSet.Size() == 0 {
 		return nil
 	}
-	shuffle := randFromHash(seed).Perm(valSet.Size())
+	seed := valSet.GetRandomness()
+
+	shuffle := random.Permutation(seed, valSet.Size())
 	reverse := make([]int, len(shuffle))
 	for i, n := range shuffle {
 		reverse[n] = i
@@ -55,11 +47,11 @@ func ShuffledRoundRobinProposer(valSet istanbul.ValidatorSet, proposer common.Ad
 	if proposer != (common.Address{}) {
 		idx += uint64(reverse[proposerIndex(valSet, proposer)]) + 1
 	}
-	return valSet.FilteredList()[shuffle[idx%uint64(valSet.Size())]]
+	return valSet.List()[shuffle[idx%uint64(valSet.Size())]]
 }
 
 // RoundRobinProposer selects the next proposer with a round robin strategy according to storage order.
-func RoundRobinProposer(valSet istanbul.ValidatorSet, proposer common.Address, round uint64, _ common.Hash) istanbul.Validator {
+func RoundRobinProposer(valSet istanbul.ValidatorSet, proposer common.Address, round uint64) istanbul.Validator {
 	if valSet.Size() == 0 {
 		return nil
 	}
@@ -67,11 +59,11 @@ func RoundRobinProposer(valSet istanbul.ValidatorSet, proposer common.Address, r
 	if proposer != (common.Address{}) {
 		idx += proposerIndex(valSet, proposer) + 1
 	}
-	return valSet.FilteredList()[idx%uint64(valSet.Size())]
+	return valSet.List()[idx%uint64(valSet.Size())]
 }
 
 // StickyProposer selects the next proposer with a sticky strategy, advancing on round change.
-func StickyProposer(valSet istanbul.ValidatorSet, proposer common.Address, round uint64, _ common.Hash) istanbul.Validator {
+func StickyProposer(valSet istanbul.ValidatorSet, proposer common.Address, round uint64) istanbul.Validator {
 	if valSet.Size() == 0 {
 		return nil
 	}
@@ -79,5 +71,20 @@ func StickyProposer(valSet istanbul.ValidatorSet, proposer common.Address, round
 	if proposer != (common.Address{}) {
 		idx += proposerIndex(valSet, proposer)
 	}
-	return valSet.FilteredList()[idx%uint64(valSet.Size())]
+	return valSet.List()[idx%uint64(valSet.Size())]
+}
+
+// GetProposerSelector returns the ProposerSelector for the given Policy
+func GetProposerSelector(pp istanbul.ProposerPolicy) istanbul.ProposerSelector {
+	switch pp {
+	case istanbul.Sticky:
+		return StickyProposer
+	case istanbul.RoundRobin:
+		return RoundRobinProposer
+	case istanbul.ShuffledRoundRobin:
+		return ShuffledRoundRobinProposer
+	default:
+		// Programming error.
+		panic(fmt.Sprintf("unknown proposer selection policy: %v", pp))
+	}
 }

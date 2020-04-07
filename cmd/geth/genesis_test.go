@@ -33,44 +33,32 @@ var customGenesisTests = []struct {
 		genesis: `{
 			"alloc"      : {},
 			"coinbase"   : "0x0000000000000000000000000000000000000000",
-			"difficulty" : "0x20000",
 			"extraData"  : "",
-			"gasLimit"   : "0x2fefd8",
-			"nonce"      : "0x0000000000000042",
-			"mixhash"    : "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"parentHash" : "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"timestamp"  : "0x00"
 		}`,
-		query:  "eth.getBlock(0).nonce",
-		result: "0x0000000000000042",
+		query:  "eth.getBlock(0).timestamp",
+		result: "0",
 	},
 	// Genesis file with an empty chain configuration (ensure missing fields work)
 	{
 		genesis: `{
 			"alloc"      : {},
 			"coinbase"   : "0x0000000000000000000000000000000000000000",
-			"difficulty" : "0x20000",
 			"extraData"  : "",
-			"gasLimit"   : "0x2fefd8",
-			"nonce"      : "0x0000000000000042",
-			"mixhash"    : "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"parentHash" : "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"timestamp"  : "0x00",
 			"config"     : {}
 		}`,
-		query:  "eth.getBlock(0).nonce",
-		result: "0x0000000000000042",
+		query:  "eth.getBlock(0).timestamp",
+		result: "0",
 	},
 	// Genesis file with specific chain configurations
 	{
 		genesis: `{
 			"alloc"      : {},
 			"coinbase"   : "0x0000000000000000000000000000000000000000",
-			"difficulty" : "0x20000",
 			"extraData"  : "",
-			"gasLimit"   : "0x2fefd8",
-			"nonce"      : "0x0000000000000042",
-			"mixhash"    : "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"parentHash" : "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"timestamp"  : "0x00",
 			"config"     : {
@@ -79,8 +67,8 @@ var customGenesisTests = []struct {
 				"daoForkSupport" : true
 			}
 		}`,
-		query:  "eth.getBlock(0).nonce",
-		result: "0x0000000000000042",
+		query:  "eth.getBlock(0).timestamp",
+		result: "0",
 	},
 }
 
@@ -101,7 +89,7 @@ func TestCustomGenesis(t *testing.T) {
 
 		// Query the custom genesis block
 		geth := runGeth(t,
-			"--datadir", datadir, "--maxpeers", "0", "--port", "0", "--lightpeers", "0",
+			"--datadir", datadir, "--maxpeers", "0", "--port", "0", "--light.maxpeers", "0",
 			"--nodiscover", "--nat", "none", "--ipcdisable",
 			"--exec", tt.query, "console")
 		geth.ExpectRegexp(tt.result)

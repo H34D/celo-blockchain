@@ -17,10 +17,11 @@
 package istanbul
 
 import (
-	"bytes"
 	"encoding/hex"
 	"errors"
 	"math/big"
+
+	blscrypto "github.com/ethereum/go-ethereum/crypto/bls"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -80,14 +81,19 @@ func IsLastBlockOfEpoch(number uint64, epochSize uint64) bool {
 	return GetNumberWithinEpoch(number, epochSize) == epochSize
 }
 
+func IsFirstBlockOfEpoch(number uint64, epochSize uint64) bool {
+	return GetNumberWithinEpoch(number, epochSize) == 1
+}
+
 // Retrieves the epoch number given the block number.
 // There is a special case if the number == 0 (the genesis block).  That block will be in the
 // 1st epoch.
 func GetEpochNumber(number uint64, epochSize uint64) uint64 {
-	if number == 0 {
-		return 0
+	epochNumber := number / epochSize
+	if IsLastBlockOfEpoch(number, epochSize) {
+		return epochNumber
 	} else {
-		return (number / epochSize) + 1
+		return epochNumber + 1
 	}
 }
 
@@ -108,6 +114,26 @@ func GetEpochLastBlockNumber(epochNumber uint64, epochSize uint64) uint64 {
 	return firstBlockNum + (epochSize - 1)
 }
 
+func GetValScoreTallyFirstBlockNumber(epochNumber uint64, epochSize uint64, lookbackWindowSize uint64) uint64 {
+	// We need to wait for the completion of the first window with the start window's block being the
+	// 2nd block of the epoch, before we start tallying the validator score for epoch "epochNumber".
+	// We can't include the epoch's first block since it's aggregated parent seals
+	// is for the previous epoch's valset.
+
+	epochFirstBlock, _ := GetEpochFirstBlockNumber(epochNumber, epochSize)
+	return epochFirstBlock + 1 + (lookbackWindowSize - 1)
+}
+
+func GetValScoreTallyLastBlockNumber(epochNumber uint64, epochSize uint64) uint64 {
+	// We stop tallying for epoch "epochNumber" at the second to last block of that epoch.
+	// We can't include that epoch's last block as part of the tally because the epoch val score is calculated
+	// using a tally that is updated AFTER a block is finalized.
+	// Note that it's possible to count up to the last block of the epoch, but it's much harder to implement
+	// than couting up to the second to last one.
+
+	return GetEpochLastBlockNumber(epochNumber, epochSize) - 1
+}
+
 func ValidatorSetDiff(oldValSet []ValidatorData, newValSet []ValidatorData) ([]ValidatorData, *big.Int) {
 	valSetMap := make(map[common.Address]bool)
 	oldValSetIndices := make(map[common.Address]int)
@@ -122,7 +148,7 @@ func ValidatorSetDiff(oldValSet []ValidatorData, newValSet []ValidatorData) ([]V
 	var addedValidators []ValidatorData
 	for _, newVal := range newValSet {
 		index, ok := oldValSetIndices[newVal.Address]
-		if ok && bytes.Equal(oldValSet[index].BLSPublicKey, newVal.BLSPublicKey) {
+		if ok && (oldValSet[index].BLSPublicKey == newVal.BLSPublicKey) {
 			// We found a common validator.  Pop from the map
 			delete(valSetMap, newVal.Address)
 		} else {
@@ -157,13 +183,13 @@ func CompareValidatorSlices(valSet1 []common.Address, valSet2 []common.Address) 
 	return true
 }
 
-func CompareValidatorPublicKeySlices(valSet1 [][]byte, valSet2 [][]byte) bool {
+func CompareValidatorPublicKeySlices(valSet1 []blscrypto.SerializedPublicKey, valSet2 []blscrypto.SerializedPublicKey) bool {
 	if len(valSet1) != len(valSet2) {
 		return false
 	}
 
 	for i := 0; i < len(valSet1); i++ {
-		if !bytes.Equal(valSet1[i], valSet2[i]) {
+		if valSet1[i] != valSet2[i] {
 			return false
 		}
 	}
@@ -171,10 +197,10 @@ func CompareValidatorPublicKeySlices(valSet1 [][]byte, valSet2 [][]byte) bool {
 	return true
 }
 
-func ConvertPublicKeysToStringSlice(publicKeys [][]byte) []string {
+func ConvertPublicKeysToStringSlice(publicKeys []blscrypto.SerializedPublicKey) []string {
 	publicKeyStrs := []string{}
 	for i := 0; i < len(publicKeys); i++ {
-		publicKeyStrs = append(publicKeyStrs, hex.EncodeToString(publicKeys[i]))
+		publicKeyStrs = append(publicKeyStrs, hex.EncodeToString(publicKeys[i][:]))
 	}
 
 	return publicKeyStrs

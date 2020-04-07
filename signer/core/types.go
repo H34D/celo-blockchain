@@ -1,18 +1,18 @@
 // Copyright 2018 The go-ethereum Authors
-// This file is part of go-ethereum.
+// This file is part of the go-ethereum library.
 //
-// go-ethereum is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// go-ethereum is distributed in the hope that it will be useful,
+// The go-ethereum library is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
+// GNU Lesser General Public License for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with go-ethereum. If not, see <http://www.gnu.org/licenses/>.
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
 package core
 
@@ -22,35 +22,10 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 )
-
-type Accounts []Account
-
-func (as Accounts) String() string {
-	var output []string
-	for _, a := range as {
-		output = append(output, a.String())
-	}
-	return strings.Join(output, "\n")
-}
-
-type Account struct {
-	Typ     string         `json:"type"`
-	URL     accounts.URL   `json:"url"`
-	Address common.Address `json:"address"`
-}
-
-func (a Account) String() string {
-	s, err := json.Marshal(a)
-	if err == nil {
-		return string(s)
-	}
-	return err.Error()
-}
 
 type ValidationInfo struct {
 	Typ     string `json:"type"`
@@ -66,13 +41,13 @@ const (
 	INFO = "Info"
 )
 
-func (vs *ValidationMessages) crit(msg string) {
+func (vs *ValidationMessages) Crit(msg string) {
 	vs.Messages = append(vs.Messages, ValidationInfo{CRIT, msg})
 }
-func (vs *ValidationMessages) warn(msg string) {
+func (vs *ValidationMessages) Warn(msg string) {
 	vs.Messages = append(vs.Messages, ValidationInfo{WARN, msg})
 }
-func (vs *ValidationMessages) info(msg string) {
+func (vs *ValidationMessages) Info(msg string) {
 	vs.Messages = append(vs.Messages, ValidationInfo{INFO, msg})
 }
 
@@ -85,24 +60,25 @@ func (v *ValidationMessages) getWarnings() error {
 		}
 	}
 	if len(messages) > 0 {
-		return fmt.Errorf("Validation failed: %s", strings.Join(messages, ","))
+		return fmt.Errorf("validation failed: %s", strings.Join(messages, ","))
 	}
 	return nil
 }
 
 // SendTxArgs represents the arguments to submit a transaction
 type SendTxArgs struct {
-	From            common.MixedcaseAddress  `json:"from"`
-	To              *common.MixedcaseAddress `json:"to"`
-	Gas             hexutil.Uint64           `json:"gas"`
-	GasPrice        hexutil.Big              `json:"gasPrice"`
-	GasCurrency     *common.MixedcaseAddress `json:"gasCurrency"`
-	GasFeeRecipient *common.MixedcaseAddress `json:"gasFeeRecipient"`
-	Value           hexutil.Big              `json:"value"`
-	Nonce           hexutil.Uint64           `json:"nonce"`
+	From                common.MixedcaseAddress  `json:"from"`
+	To                  *common.MixedcaseAddress `json:"to"`
+	Gas                 hexutil.Uint64           `json:"gas"`
+	GasPrice            hexutil.Big              `json:"gasPrice"`
+	FeeCurrency         *common.MixedcaseAddress `json:"feeCurrency"`
+	GatewayFeeRecipient *common.MixedcaseAddress `json:"gatewayFeeRecipient"`
+	GatewayFee          hexutil.Big              `json:"gatewayFee"`
+	Value               hexutil.Big              `json:"value"`
+	Nonce               hexutil.Uint64           `json:"nonce"`
 	// We accept "data" and "input" for backwards-compatibility reasons.
 	Data  *hexutil.Bytes `json:"data"`
-	Input *hexutil.Bytes `json:"input"`
+	Input *hexutil.Bytes `json:"input,omitempty"`
 }
 
 func (args SendTxArgs) String() string {
@@ -120,18 +96,18 @@ func (args *SendTxArgs) toTransaction() *types.Transaction {
 	} else if args.Input != nil {
 		input = *args.Input
 	}
-	var gasCurrency *common.Address = nil
-	if args.GasCurrency != nil {
-		tmp := args.GasCurrency.Address()
-		gasCurrency = &tmp
+	var feeCurrency *common.Address = nil
+	if args.FeeCurrency != nil {
+		tmp := args.FeeCurrency.Address()
+		feeCurrency = &tmp
 	}
-	var gasFeeRecipient *common.Address = nil
-	if args.GasFeeRecipient != nil {
-		tmp := args.GasFeeRecipient.Address()
-		gasFeeRecipient = &tmp
+	var gatewayFeeRecipient *common.Address = nil
+	if args.GatewayFeeRecipient != nil {
+		tmp := args.GatewayFeeRecipient.Address()
+		gatewayFeeRecipient = &tmp
 	}
 	if args.To == nil {
-		return types.NewContractCreation(uint64(args.Nonce), (*big.Int)(&args.Value), uint64(args.Gas), (*big.Int)(&args.GasPrice), gasCurrency, gasFeeRecipient, input)
+		return types.NewContractCreation(uint64(args.Nonce), (*big.Int)(&args.Value), uint64(args.Gas), (*big.Int)(&args.GasPrice), feeCurrency, gatewayFeeRecipient, (*big.Int)(&args.GatewayFee), input)
 	}
-	return types.NewTransaction(uint64(args.Nonce), args.To.Address(), (*big.Int)(&args.Value), (uint64)(args.Gas), (*big.Int)(&args.GasPrice), gasCurrency, gasFeeRecipient, input)
+	return types.NewTransaction(uint64(args.Nonce), args.To.Address(), (*big.Int)(&args.Value), (uint64)(args.Gas), (*big.Int)(&args.GasPrice), feeCurrency, gatewayFeeRecipient, (*big.Int)(&args.GatewayFee), input)
 }

@@ -289,6 +289,9 @@ func (l *txList) Forward(threshold uint64) types.Transactions {
 // is lower than the costgas cap, the caps will be reset to a new high after removing
 // the newly invalidated transactions.
 func (l *txList) Filter(costLimit *big.Int, gasLimit uint64) (types.Transactions, types.Transactions) {
+	if costLimit == nil {
+		costLimit = l.costcap
+	}
 	// If all transactions are below the threshold, short circuit
 	if l.costcap.Cmp(costLimit) <= 0 && l.gascap <= gasLimit {
 		return nil, nil
@@ -298,13 +301,13 @@ func (l *txList) Filter(costLimit *big.Int, gasLimit uint64) (types.Transactions
 
 	// Filter out all the transactions above the account's funds
 	removed := l.txs.Filter(func(tx *types.Transaction) bool {
-		if tx.GasCurrency() == nil {
-			log.Trace("Transaction Filter", "hash", tx.Hash(), "Gas currency", tx.GasCurrency(), "Cost", tx.Cost(), "Cost Limit", costLimit, "Gas", tx.Gas(), "Gas Limit", gasLimit)
+		if tx.FeeCurrency() == nil {
+			log.Trace("Transaction Filter", "hash", tx.Hash(), "Fee currency", tx.FeeCurrency(), "Cost", tx.Cost(), "Cost Limit", costLimit, "Gas", tx.Gas(), "Gas Limit", gasLimit)
 			return tx.Cost().Cmp(costLimit) > 0 || tx.Gas() > gasLimit
 		} else {
-			// If the gas is being paid in the non-native currency, ensure that the `tx.Value` is less than costLimit
-			// as the gas price will be deducted in the non-native currency.
-			log.Trace("Transaction Filter", "hash", tx.Hash(), "Gas currency", tx.GasCurrency(), "Value", tx.Value(), "Cost Limit", costLimit, "Gas", tx.Gas(), "Gas Limit", gasLimit)
+			// If the fees are being paid in the non-native currency, ensure that the `tx.Value` is less than costLimit
+			// as the fees will be deducted in the non-native currency.
+			log.Trace("Transaction Filter", "hash", tx.Hash(), "Fee currency", tx.FeeCurrency(), "Value", tx.Value(), "Cost Limit", costLimit, "Gas", tx.Gas(), "Gas Limit", gasLimit)
 			return tx.Value().Cmp(costLimit) > 0 || tx.Gas() > gasLimit
 		}
 	})
@@ -425,14 +428,14 @@ func newTxPricedList(all *txLookup) *txPricedList {
 
 // Gets the price heap for the given currency
 func (l *txPricedList) getPriceHeap(tx *types.Transaction) *priceHeap {
-	gasCurrency := tx.GasCurrency()
-	if gasCurrency == nil {
+	feeCurrency := tx.FeeCurrency()
+	if feeCurrency == nil {
 		return l.nilCurrencyHeap
 	} else {
-		if _, ok := l.nonNilCurrencyHeaps[*gasCurrency]; !ok {
-			l.nonNilCurrencyHeaps[*gasCurrency] = new(priceHeap)
+		if _, ok := l.nonNilCurrencyHeaps[*feeCurrency]; !ok {
+			l.nonNilCurrencyHeaps[*feeCurrency] = new(priceHeap)
 		}
-		return l.nonNilCurrencyHeaps[*gasCurrency]
+		return l.nonNilCurrencyHeaps[*feeCurrency]
 	}
 }
 
@@ -445,9 +448,9 @@ func (l *txPricedList) Put(tx *types.Transaction) {
 // Removed notifies the prices transaction list that an old transaction dropped
 // from the pool. The list will just keep a counter of stale objects and update
 // the heap if a large enough ratio of transactions go stale.
-func (l *txPricedList) Removed() {
+func (l *txPricedList) Removed(count int) {
 	// Bump the stale counter, but exit if still too low (< 25%)
-	l.stales++
+	l.stales += count
 	if l.stales <= l.Len()/4 {
 		return
 	}
@@ -455,9 +458,9 @@ func (l *txPricedList) Removed() {
 	reheapNilCurrencyHeap := make(priceHeap, 0, l.all.nilCurrencyTxCurrCount)
 
 	reheapNonNilCurrencyMap := make(map[common.Address]*priceHeap)
-	for gasCurrency, count := range l.all.nonNilCurrencyTxCurrCount {
+	for feeCurrency, count := range l.all.nonNilCurrencyTxCurrCount {
 		reheapNonNilCurrencyHeap := make(priceHeap, 0, count)
-		reheapNonNilCurrencyMap[gasCurrency] = &reheapNonNilCurrencyHeap
+		reheapNonNilCurrencyMap[feeCurrency] = &reheapNonNilCurrencyHeap
 	}
 
 	l.stales, l.nonNilCurrencyHeaps, l.nilCurrencyHeap = 0, reheapNonNilCurrencyMap, &reheapNilCurrencyHeap
@@ -488,7 +491,7 @@ func (l *txPricedList) Cap(cgThreshold *big.Int, local *accountSet) types.Transa
 			continue
 		}
 
-		if currency.Cmp(tx.GasPrice(), tx.GasCurrency(), cgThreshold, nil) >= 0 {
+		if currency.Cmp(tx.GasPrice(), tx.FeeCurrency(), cgThreshold, nil) >= 0 {
 			save = append(save, tx)
 			break
 		}
@@ -530,7 +533,7 @@ func (l *txPricedList) Underpriced(tx *types.Transaction, local *accountSet) boo
 	}
 
 	cheapest := l.getMinPricedTx()
-	return currency.Cmp(cheapest.GasPrice(), cheapest.GasCurrency(), tx.GasPrice(), tx.GasCurrency()) >= 0
+	return currency.Cmp(cheapest.GasPrice(), cheapest.FeeCurrency(), tx.GasPrice(), tx.FeeCurrency()) >= 0
 }
 
 // Discard finds a number of most underpriced transactions, removes them from the
@@ -578,7 +581,7 @@ func (l *txPricedList) getHeapWithMinHead() (*priceHeap, *types.Transaction) {
 				cheapestTxn = []*types.Transaction(*cheapestHeap)[0]
 			} else {
 				txn := []*types.Transaction(*priceHeap)[0]
-				if currency.Cmp(txn.GasPrice(), txn.GasCurrency(), cheapestTxn.GasPrice(), cheapestTxn.GasCurrency()) < 0 {
+				if currency.Cmp(txn.GasPrice(), txn.FeeCurrency(), cheapestTxn.GasPrice(), cheapestTxn.FeeCurrency()) < 0 {
 					cheapestHeap = priceHeap
 				}
 			}

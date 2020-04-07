@@ -21,11 +21,19 @@ import "errors"
 var (
 	// ErrUnauthorizedAddress is returned when given address cannot be found in
 	// current validator set.
-	ErrUnauthorizedAddress = errors.New("unauthorized address")
+	ErrUnauthorizedAddress = errors.New("not an elected validator")
 	// ErrInvalidSigner is returned if a message's signature does not correspond to the address in msg.Address
 	ErrInvalidSigner = errors.New("signed by incorrect validator")
 	// ErrStoppedEngine is returned if the engine is stopped
 	ErrStoppedEngine = errors.New("stopped engine")
 	// ErrStartedEngine is returned if the engine is already started
 	ErrStartedEngine = errors.New("started engine")
+	// ErrStoppedAnnounce is returned if announce is stopped
+	ErrStoppedAnnounce = errors.New("stopped announce")
+	// ErrStartedAnnounce is returned if announce is already started
+	ErrStartedAnnounce = errors.New("started announce")
+	// ErrStoppedVPHThread is returned if validator peer handler thread is stopped
+	ErrStoppedVPHThread = errors.New("stopped validator peer handler thread")
+	// ErrStartedVPHThread is returned if validator peer handler thread is already started
+	ErrStartedVPHThread = errors.New("started validator peer handler thread")
 )

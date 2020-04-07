@@ -18,12 +18,34 @@ package core
 
 import (
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
+	"github.com/ethereum/go-ethereum/consensus/istanbul/validator"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
+	"github.com/ethereum/go-ethereum/rlp"
 )
+
+type MessageSet interface {
+	fmt.Stringer
+	Add(msg *istanbul.Message) error
+	GetAddressIndex(addr common.Address) (uint64, error)
+	Remove(address common.Address)
+	Values() (result []*istanbul.Message)
+	Size() int
+	Get(addr common.Address) *istanbul.Message
+	Addresses() []common.Address
+	Serialize() ([]byte, error)
+}
+
+type messageSetImpl struct {
+	valSet     istanbul.ValidatorSet
+	messagesMu *sync.Mutex
+	messages   map[common.Address]*istanbul.Message
+}
 
 // Construct a new message set to accumulate messages for given sequence/view number.
 func newMessageSet(valSet istanbul.ValidatorSet) MessageSet {
@@ -34,23 +56,17 @@ func newMessageSet(valSet istanbul.ValidatorSet) MessageSet {
 	}
 }
 
+func deserializeMessageSet(binaryData []byte) (MessageSet, error) {
+	var ms messageSetImpl
+
+	err := rlp.DecodeBytes(binaryData, &ms)
+	if err != nil {
+		return nil, err
+	}
+	return &ms, nil
+}
+
 // ----------------------------------------------------------------------------
-
-type MessageSet interface {
-	fmt.Stringer
-	Add(msg *istanbul.Message) error
-	GetAddressIndex(addr common.Address) (uint64, error)
-	Remove(address common.Address)
-	Values() (result []*istanbul.Message)
-	Size() int
-	Get(addr common.Address) *istanbul.Message
-}
-
-type messageSetImpl struct {
-	valSet     istanbul.ValidatorSet
-	messagesMu *sync.Mutex
-	messages   map[common.Address]*istanbul.Message
-}
 
 func (ms *messageSetImpl) Add(msg *istanbul.Message) error {
 	ms.messagesMu.Lock()
@@ -68,8 +84,8 @@ func (ms *messageSetImpl) GetAddressIndex(addr common.Address) (uint64, error) {
 	ms.messagesMu.Lock()
 	defer ms.messagesMu.Unlock()
 
-	i, v := ms.valSet.GetByAddress(addr)
-	if v == nil {
+	i := ms.valSet.GetIndex(addr)
+	if i == -1 {
 		return 0, istanbul.ErrUnauthorizedAddress
 	}
 
@@ -106,6 +122,20 @@ func (ms *messageSetImpl) Get(addr common.Address) *istanbul.Message {
 	return ms.messages[addr]
 }
 
+func (ms *messageSetImpl) Addresses() []common.Address {
+	ms.messagesMu.Lock()
+	defer ms.messagesMu.Unlock()
+	returnList := make([]common.Address, len(ms.messages))
+
+	i := 0
+	for addr := range ms.messages {
+		returnList[i] = addr
+		i++
+	}
+
+	return returnList
+}
+
 func (ms *messageSetImpl) String() string {
 	ms.messagesMu.Lock()
 	defer ms.messagesMu.Unlock()
@@ -114,4 +144,66 @@ func (ms *messageSetImpl) String() string {
 		addresses = append(addresses, v.Address.String())
 	}
 	return fmt.Sprintf("[<%v> %v]", len(ms.messages), strings.Join(addresses, ", "))
+}
+
+func (s *messageSetImpl) Serialize() ([]byte, error) {
+	return rlp.EncodeToBytes(s)
+}
+
+// RLP Encoding -----------------------------------------------------------------------
+
+// EncodeRLP impl
+func (s *messageSetImpl) EncodeRLP(w io.Writer) error {
+	serializedValSet, err := s.valSet.Serialize()
+	if err != nil {
+		return err
+	}
+
+	messageKeys := make([]common.Address, len(s.messages))
+	messageValues := make([]*istanbul.Message, len(s.messages))
+
+	i := 0
+	for k, v := range s.messages {
+		messageKeys[i] = k
+		messageValues[i] = v
+		i++
+	}
+
+	return rlp.Encode(w, []interface{}{
+		serializedValSet,
+		messageKeys,
+		messageValues,
+	})
+}
+
+// DecodeRLP Impl
+func (s *messageSetImpl) DecodeRLP(stream *rlp.Stream) error {
+	var data struct {
+		SerializedValSet []byte
+		MessageKeys      []common.Address
+		MessageValues    []*istanbul.Message
+	}
+
+	err := stream.Decode(&data)
+	if err != nil {
+		return err
+	}
+
+	valSet, err := validator.DeserializeValidatorSet(data.SerializedValSet)
+	if err != nil {
+		return err
+	}
+
+	messages := make(map[common.Address]*istanbul.Message)
+	for i, addr := range data.MessageKeys {
+		messages[addr] = data.MessageValues[i]
+	}
+
+	*s = messageSetImpl{
+		valSet:     valSet,
+		messages:   messages,
+		messagesMu: new(sync.Mutex),
+	}
+
+	return nil
 }

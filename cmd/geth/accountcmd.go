@@ -23,14 +23,20 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
+	"github.com/ethereum/go-ethereum/accounts/usbwallet"
 	"github.com/ethereum/go-ethereum/cmd/utils"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/console"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
-	"gopkg.in/urfave/cli.v1"
+	cli "gopkg.in/urfave/cli.v1"
 )
 
 var (
+	blsFlag = cli.BoolFlag{
+		Name:  "bls",
+		Usage: "Set to specify generation of proof-of-possession of a BLS key.",
+	}
 	walletCommand = cli.Command{
 		Name:      "wallet",
 		Usage:     "Manage Ethereum presale wallets",
@@ -103,17 +109,24 @@ Make sure you backup your keys regularly.`,
 Print a short summary of all accounts`,
 			},
 			{
-				Name:   "proof-of-possession",
-				Usage:  "Generate a proof-of-possession for the given account",
-				Action: utils.MigrateFlags(accountProofOfPossession),
+				Name:      "proof-of-possession",
+				Usage:     "Generate a proof-of-possession for the given account.",
+				Action:    utils.MigrateFlags(accountProofOfPossession),
+				ArgsUsage: "<signer address> <message>",
 				Flags: []cli.Flag{
 					utils.DataDirFlag,
 					utils.KeyStoreDirFlag,
 					utils.PasswordFileFlag,
 					utils.LightKDFFlag,
+					blsFlag,
 				},
 				Description: `
 Print a proof-of-possession signature for the given account.
+
+Creates a signature over the given message, for example an account address,
+with the private key corresponding to a given signer address. The signature
+can then be used to prove possession of the signing key, for example to
+authorize a the signer to act as a validator in the Celo protocol.
 `,
 			},
 			{
@@ -131,11 +144,11 @@ Print a proof-of-possession signature for the given account.
 
 Creates a new account and prints the address.
 
-The account is saved in encrypted format, you are prompted for a passphrase.
+The account is saved in encrypted format, you are prompted for a password.
 
-You must remember this passphrase to unlock your account in the future.
+You must remember this password to unlock your account in the future.
 
-For non-interactive use the passphrase can be specified with the --password flag:
+For non-interactive use the password can be specified with the --password flag:
 
 Note, this is meant to be used for testing only, it is a bad idea to save your
 password to file or expose in any other way.
@@ -157,39 +170,17 @@ password to file or expose in any other way.
 Update an existing account.
 
 The account is saved in the newest version in encrypted format, you are prompted
-for a passphrase to unlock the account and another to save the updated file.
+for a password to unlock the account and another to save the updated file.
 
 This same command can therefore be used to migrate an account of a deprecated
 format to the newest format or change the password for an account.
 
-For non-interactive use the passphrase can be specified with the --password flag:
+For non-interactive use the password can be specified with the --password flag:
 
     geth account update [options] <address>
 
 Since only one password can be given, only format update can be performed,
 changing your password is only possible interactively.
-`,
-			},
-			{
-				Name:   "set-node-key",
-				Usage:  "Sets the nodekey used for Istanbul consensus",
-				Action: utils.MigrateFlags(setNodeKey),
-				Flags: []cli.Flag{
-					utils.DataDirFlag,
-					utils.KeyStoreDirFlag,
-					utils.PasswordFileFlag,
-					utils.LightKDFFlag,
-				},
-				ArgsUsage: "<address>",
-				Description: `
-    geth account set-node-key <address>
-
-Sets the nodekey with the given address. This is necessary to allow other validators to know that our node is a validator as well.
-
-For non-interactive use the passphrase can be specified with the --password flag:
-
-    geth account set-node-key [options] <address>
-
 `,
 			},
 			{
@@ -211,11 +202,11 @@ Prints the address.
 
 The keyfile is assumed to contain an unencrypted private key in hexadecimal format.
 
-The account is saved in encrypted format, you are prompted for a passphrase.
+The account is saved in encrypted format, you are prompted for a password.
 
-You must remember this passphrase to unlock your account in the future.
+You must remember this password to unlock your account in the future.
 
-For non-interactive use the passphrase can be specified with the -password flag:
+For non-interactive use the password can be specified with the -password flag:
 
     geth account import [options] <keyfile>
 
@@ -241,27 +232,79 @@ func accountList(ctx *cli.Context) error {
 	return nil
 }
 
-func accountProofOfPossession(ctx *cli.Context) error {
-	if len(ctx.Args()) == 0 {
-		utils.Fatalf("No accounts specified to update")
-	}
-	stack, _ := makeConfigNode(ctx)
-	ks := stack.AccountManager().Backends(keystore.KeyStoreType)[0].(*keystore.KeyStore)
+func printProofOfPossession(account accounts.Account, pop []byte, keyType string, key []byte) {
+	fmt.Printf("Account {%x}:\n  Signature: %s\n  %s Public Key: %s\n", account.Address, hex.EncodeToString(pop), keyType, hex.EncodeToString(key))
+}
 
-	for _, addr := range ctx.Args() {
-		account, _ := unlockAccount(ctx, ks, addr, 0, nil)
-		pop, err := ks.GenerateProofOfPossession(account)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Account {%x}: %s\n", account.Address, hex.EncodeToString(pop))
+func accountProofOfPossession(ctx *cli.Context) error {
+	if len(ctx.Args()) != 2 {
+		utils.Fatalf("Please specify the address to prove possession of and the address to sign as proof-of-possession.")
 	}
+
+	stack, _ := makeConfigNode(ctx)
+	am := stack.AccountManager()
+	ks := am.Backends(keystore.KeyStoreType)[0].(*keystore.KeyStore)
+
+	signer := common.HexToAddress(ctx.Args()[0])
+	message := common.HexToAddress(ctx.Args()[1])
+
+	var err error
+	var wallet accounts.Wallet
+	account := accounts.Account{Address: signer}
+	foundAccount := false
+
+	for _, wallet = range am.Wallets() {
+		if wallet.URL().Scheme == keystore.KeyStoreScheme {
+			if wallet.Contains(account) {
+				foundAccount = true
+				break
+			}
+		} else if wallet.URL().Scheme == usbwallet.LedgerScheme {
+			if err := wallet.Open(""); err != nil {
+				if err != accounts.ErrWalletAlreadyOpen {
+					utils.Fatalf("Could not open Ledger wallet: %v", err)
+				}
+			} else {
+				defer wallet.Close()
+			}
+
+			account, err = wallet.Derive(accounts.DefaultBaseDerivationPath, true)
+			if err != nil {
+				return err
+			}
+			if account.Address == signer {
+				foundAccount = true
+				break
+			}
+		}
+	}
+	if !foundAccount {
+		utils.Fatalf("Could not find signer account %x", signer)
+	}
+
+	if wallet.URL().Scheme == keystore.KeyStoreScheme {
+		account, _ = unlockAccount(ks, signer.String(), 0, utils.MakePasswordList(ctx))
+	}
+	var key []byte
+	var pop []byte
+	keyType := "ECDSA"
+	if ctx.IsSet(blsFlag.Name) {
+		keyType = "BLS"
+		key, pop, err = ks.GenerateProofOfPossessionBLS(account, message)
+	} else {
+		key, pop, err = wallet.GenerateProofOfPossession(account, message)
+	}
+	if err != nil {
+		return err
+	}
+
+	printProofOfPossession(account, pop, keyType, key)
 
 	return nil
 }
 
 // tries unlocking the specified account a few times.
-func unlockAccount(ctx *cli.Context, ks *keystore.KeyStore, address string, i int, passwords []string) (accounts.Account, string) {
+func unlockAccount(ks *keystore.KeyStore, address string, i int, passwords []string) (accounts.Account, string) {
 	account, err := utils.MakeAddress(ks, address)
 	if err != nil {
 		utils.Fatalf("Could not list accounts: %v", err)
@@ -303,17 +346,17 @@ func getPassPhrase(prompt string, confirmation bool, i int, passwords []string) 
 	if prompt != "" {
 		fmt.Println(prompt)
 	}
-	password, err := console.Stdin.PromptPassword("Passphrase: ")
+	password, err := console.Stdin.PromptPassword("Password: ")
 	if err != nil {
-		utils.Fatalf("Failed to read passphrase: %v", err)
+		utils.Fatalf("Failed to read password: %v", err)
 	}
 	if confirmation {
-		confirm, err := console.Stdin.PromptPassword("Repeat passphrase: ")
+		confirm, err := console.Stdin.PromptPassword("Repeat password: ")
 		if err != nil {
-			utils.Fatalf("Failed to read passphrase confirmation: %v", err)
+			utils.Fatalf("Failed to read password confirmation: %v", err)
 		}
 		if password != confirm {
-			utils.Fatalf("Passphrases do not match")
+			utils.Fatalf("Passwords do not match")
 		}
 	}
 	return password
@@ -324,7 +367,7 @@ func ambiguousAddrRecovery(ks *keystore.KeyStore, err *keystore.AmbiguousAddrErr
 	for _, a := range err.Matches {
 		fmt.Println("  ", a.URL)
 	}
-	fmt.Println("Testing your passphrase against all of them...")
+	fmt.Println("Testing your password against all of them...")
 	var match *accounts.Account
 	for _, a := range err.Matches {
 		if err := ks.Unlock(a, auth); err == nil {
@@ -335,7 +378,7 @@ func ambiguousAddrRecovery(ks *keystore.KeyStore, err *keystore.AmbiguousAddrErr
 	if match == nil {
 		utils.Fatalf("None of the listed files could be unlocked.")
 	}
-	fmt.Printf("Your passphrase unlocked %s\n", match.URL)
+	fmt.Printf("Your password unlocked %s\n", match.URL)
 	fmt.Println("In order to avoid this warning, you need to remove the following duplicate key files:")
 	for _, a := range err.Matches {
 		if a != *match {
@@ -363,12 +406,18 @@ func accountCreate(ctx *cli.Context) error {
 
 	password := getPassPhrase("Your new account is locked with a password. Please give a password. Do not forget this password.", true, 0, utils.MakePasswordList(ctx))
 
-	address, err := keystore.StoreKey(keydir, password, scryptN, scryptP)
+	account, err := keystore.StoreKey(keydir, password, scryptN, scryptP)
 
 	if err != nil {
 		utils.Fatalf("Failed to create account: %v", err)
 	}
-	fmt.Printf("Address: {%x}\n", address)
+	fmt.Printf("\nYour new key was generated\n\n")
+	fmt.Printf("Public address of the key:   %s\n", account.Address.Hex())
+	fmt.Printf("Path of the secret key file: %s\n\n", account.URL.Path)
+	fmt.Printf("- You can share your public address with anyone. Others need it to interact with you.\n")
+	fmt.Printf("- You must NEVER share the secret key with anyone! The key controls access to your funds!\n")
+	fmt.Printf("- You must BACKUP your key file! Without the key, it's impossible to access account funds!\n")
+	fmt.Printf("- You must REMEMBER your password! Without the password, it's impossible to decrypt the key!\n\n")
 	return nil
 }
 
@@ -382,36 +431,11 @@ func accountUpdate(ctx *cli.Context) error {
 	ks := stack.AccountManager().Backends(keystore.KeyStoreType)[0].(*keystore.KeyStore)
 
 	for _, addr := range ctx.Args() {
-		account, oldPassword := unlockAccount(ctx, ks, addr, 0, nil)
+		account, oldPassword := unlockAccount(ks, addr, 0, nil)
 		newPassword := getPassPhrase("Please give a new password. Do not forget this password.", true, 0, nil)
 		if err := ks.Update(account, oldPassword, newPassword); err != nil {
 			utils.Fatalf("Could not update the account: %v", err)
 		}
-	}
-	return nil
-}
-
-func setNodeKey(ctx *cli.Context) error {
-	if len(ctx.Args()) == 0 {
-		utils.Fatalf("No accounts specified to set the nodekey for")
-	}
-
-	stack, config := makeConfigNode(ctx)
-	ks := stack.AccountManager().Backends(keystore.KeyStoreType)[0].(*keystore.KeyStore)
-
-	for _, addr := range ctx.Args() {
-		account, oldPassword := unlockAccount(ctx, ks, addr, 0, nil)
-		if (account == accounts.Account{}) {
-			utils.Fatalf("Could not unlock account")
-			continue
-		}
-
-		if err := ks.SetNodeKey(account, oldPassword, config.Node.ResolvePath("nodekey")); err != nil {
-			utils.Fatalf("Could not setNodeKey for the account: %v", err)
-		}
-
-		log.Info("Set nodekey", "address", account.Address)
-
 	}
 	return nil
 }

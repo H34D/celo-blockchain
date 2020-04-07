@@ -49,11 +49,12 @@ type TransactOpts struct {
 	Nonce  *big.Int       // Nonce to use for the transaction execution (nil = use pending state)
 	Signer SignerFn       // Method to use for signing the transaction (mandatory)
 
-	Value           *big.Int        // Funds to transfer along along the transaction (nil = 0 = no funds)
-	GasPrice        *big.Int        // Gas price to use for the transaction execution (nil = gas price oracle)
-	GasCurrency     *common.Address // Gas currency to be used for transaction (nil = default currency = Celo Gold)
-	GasFeeRecipient *common.Address // Address to which gas fees should be paid (nil = fees are returned to sender)
-	GasLimit        uint64          // Gas limit to set for the transaction execution (0 = estimate)
+	Value               *big.Int        // Funds to transfer along along the transaction (nil = 0 = no funds)
+	GasPrice            *big.Int        // Gas price to use for the transaction execution (nil = gas price oracle)
+	FeeCurrency         *common.Address // Fee currency to be used for transaction (nil = default currency = Celo Gold)
+	GatewayFeeRecipient *common.Address // Address to which gateway fees should be paid (nil = no gateway fees are paid)
+	GatewayFee          *big.Int        // Value of gateway fees to be paid (nil = no gateway fees are paid)
+	GasLimit            uint64          // Gas limit to set for the transaction execution (0 = estimate)
 
 	Context context.Context // Network context to support cancellation and timeouts (nil = no timeout)
 }
@@ -113,6 +114,11 @@ func DeployContract(opts *TransactOpts, abi abi.ABI, bytecode []byte, backend Co
 	}
 	c.address = crypto.CreateAddress(opts.From, tx.Nonce())
 	return c.address, tx, c, nil
+}
+
+// ABI returns the bound contract parsed ABI
+func (c *BoundContract) ABI() abi.ABI {
+	return c.abi
 }
 
 // Call invokes the (constant) contract method with params as input values and
@@ -209,17 +215,19 @@ func (c *BoundContract) transact(opts *TransactOpts, contract *common.Address, i
 			return nil, fmt.Errorf("failed to suggest gas price: %v", err)
 		}
 	}
-	gasCurrency := opts.GasCurrency
-	// TODO(ashishb): Add SuggestGasCurrency to Transactor to get gas currency
+
+	feeCurrency := opts.FeeCurrency
+	// TODO(nategraf): Add SuggestFeeCurrency to Transactor to get fee currency
 	// Otherwise, the user might not be able to pay in non-native currency for contract
 	// deployment. Paying for Contract deployment in non-native currency might not work right now.
 	// Only paying for token transfer in non-native currency is supported.
-	//if gasCurrency == 0 {
-	//	gasCurrency = c.transactor.SuggestGasCurrency(opts.Context)
+	//if feeCurrency == 0 {
+	//	feeCurrency = c.transactor.SuggestFeeCurrency(opts.Context)
 	//}
 
-	gasFeeRecipient := opts.GasFeeRecipient
-	// TODO(asa): Add SuggestGasFeeRecipient to Transactor.
+	gatewayFeeRecipient := opts.GatewayFeeRecipient
+	gatewayFee := opts.GatewayFee
+	// TODO(nategraf): Add SuggestGatewayFee to Transactor.
 
 	gasLimit := opts.GasLimit
 	if gasLimit == 0 {
@@ -232,7 +240,7 @@ func (c *BoundContract) transact(opts *TransactOpts, contract *common.Address, i
 			}
 		}
 		// If the contract surely has code (or code is not needed), estimate the transaction
-		msg := ethereum.CallMsg{From: opts.From, To: contract, Value: value, Data: input}
+		msg := ethereum.CallMsg{From: opts.From, To: contract, GasPrice: gasPrice, Value: value, Data: input}
 		gasLimit, err = c.transactor.EstimateGas(ensureContext(opts.Context), msg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to estimate gas needed: %v", err)
@@ -241,9 +249,9 @@ func (c *BoundContract) transact(opts *TransactOpts, contract *common.Address, i
 	// Create the transaction, sign it and schedule it for execution
 	var rawTx *types.Transaction
 	if contract == nil {
-		rawTx = types.NewContractCreation(nonce, value, gasLimit, gasPrice, gasCurrency, gasFeeRecipient, input)
+		rawTx = types.NewContractCreation(nonce, value, gasLimit, gasPrice, feeCurrency, gatewayFeeRecipient, gatewayFee, input)
 	} else {
-		rawTx = types.NewTransaction(nonce, c.address, value, gasLimit, gasPrice, gasCurrency, gasFeeRecipient, input)
+		rawTx = types.NewTransaction(nonce, c.address, value, gasLimit, gasPrice, feeCurrency, gatewayFeeRecipient, gatewayFee, input)
 	}
 	if opts.Signer == nil {
 		return nil, errors.New("no signer to authorize the transaction with")
@@ -258,6 +266,19 @@ func (c *BoundContract) transact(opts *TransactOpts, contract *common.Address, i
 	return signedTx, nil
 }
 
+// LogEventName will verify the log belongs to the contract and return the eventName for it
+func (c *BoundContract) LogEventName(log types.Log) (eventName string, ok bool, err error) {
+	if log.Address != c.address || len(log.Topics) < 1 {
+		return "", false, err
+	}
+
+	event, err := c.abi.EventByID(log.Topics[0])
+	if err != nil {
+		return "", false, err
+	}
+	return event.Name, true, nil
+}
+
 // FilterLogs filters contract logs for past blocks, returning the necessary
 // channels to construct a strongly typed bound iterator on top of them.
 func (c *BoundContract) FilterLogs(opts *FilterOpts, name string, query ...[]interface{}) (chan types.Log, event.Subscription, error) {
@@ -266,7 +287,7 @@ func (c *BoundContract) FilterLogs(opts *FilterOpts, name string, query ...[]int
 		opts = new(FilterOpts)
 	}
 	// Append the event selector to the query parameters and construct the topic set
-	query = append([][]interface{}{{c.abi.Events[name].Id()}}, query...)
+	query = append([][]interface{}{{c.abi.Events[name].ID()}}, query...)
 
 	topics, err := makeTopics(query...)
 	if err != nil {
@@ -315,7 +336,7 @@ func (c *BoundContract) WatchLogs(opts *WatchOpts, name string, query ...[]inter
 		opts = new(WatchOpts)
 	}
 	// Append the event selector to the query parameters and construct the topic set
-	query = append([][]interface{}{{c.abi.Events[name].Id()}}, query...)
+	query = append([][]interface{}{{c.abi.Events[name].ID()}}, query...)
 
 	topics, err := makeTopics(query...)
 	if err != nil {
@@ -352,6 +373,22 @@ func (c *BoundContract) UnpackLog(out interface{}, event string, log types.Log) 
 		}
 	}
 	return parseTopics(out, indexed, log.Topics[1:])
+}
+
+// UnpackLogIntoMap unpacks a retrieved log into the provided map.
+func (c *BoundContract) UnpackLogIntoMap(out map[string]interface{}, event string, log types.Log) error {
+	if len(log.Data) > 0 {
+		if err := c.abi.UnpackIntoMap(out, event, log.Data); err != nil {
+			return err
+		}
+	}
+	var indexed abi.Arguments
+	for _, arg := range c.abi.Events[event].Inputs {
+		if arg.Indexed {
+			indexed = append(indexed, arg)
+		}
+	}
+	return parseTopicsIntoMap(out, indexed, log.Topics[1:])
 }
 
 // ensureContext is a helper method to ensure a context is not nil, even if the

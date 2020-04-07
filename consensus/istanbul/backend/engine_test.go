@@ -19,29 +19,27 @@ package backend
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"fmt"
 	"math/big"
-	"math/rand"
-	"os"
-	"path/filepath"
 	"reflect"
-	"strconv"
 	"testing"
 	"time"
 
-	bls "github.com/celo-org/bls-zexe/go"
+	"github.com/celo-org/bls-zexe/go/bls"
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/consensustest"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
 	"github.com/ethereum/go-ethereum/contract_comm"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	blscrypto "github.com/ethereum/go-ethereum/crypto/bls"
-	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 )
@@ -51,70 +49,72 @@ import (
 // other fake events to process Istanbul.
 func newBlockChain(n int, isFullChain bool) (*core.BlockChain, *Backend) {
 	genesis, nodeKeys := getGenesisAndKeys(n, isFullChain)
-	memDB := ethdb.NewMemDatabase()
+	memDB := rawdb.NewMemoryDatabase()
 	config := istanbul.DefaultConfig
 	config.ValidatorEnodeDBPath = ""
+	config.VersionCertificateDBPath = ""
+	config.RoundStateDBPath = ""
 	// Use the first key as private key
-	address := crypto.PubkeyToAddress(nodeKeys[0].PublicKey)
-	signerFn := func(_ accounts.Account, data []byte) ([]byte, error) {
-		return crypto.Sign(data, nodeKeys[0])
+	publicKey := nodeKeys[0].PublicKey
+	address := crypto.PubkeyToAddress(publicKey)
+	signerFn := func(_ accounts.Account, mimeType string, data []byte) ([]byte, error) {
+		return crypto.Sign(crypto.Keccak256(data), nodeKeys[0])
 	}
 
-	signerBLSHashFn := func(_ accounts.Account, data []byte) ([]byte, error) {
+	signerBLSHashFn := func(_ accounts.Account, data []byte) (blscrypto.SerializedSignature, error) {
 		key := nodeKeys[0]
 		privateKeyBytes, err := blscrypto.ECDSAToBLS(key)
 		if err != nil {
-			return nil, err
+			return blscrypto.SerializedSignature{}, err
 		}
 
 		privateKey, err := bls.DeserializePrivateKey(privateKeyBytes)
 		if err != nil {
-			return nil, err
+			return blscrypto.SerializedSignature{}, err
 		}
 		defer privateKey.Destroy()
 
 		signature, err := privateKey.SignMessage(data, []byte{}, false)
 		if err != nil {
-			return nil, err
+			return blscrypto.SerializedSignature{}, err
 		}
 		defer signature.Destroy()
 		signatureBytes, err := signature.Serialize()
 		if err != nil {
-			return nil, err
+			return blscrypto.SerializedSignature{}, err
 		}
 
-		return signatureBytes, nil
+		return blscrypto.SerializedSignatureFromBytes(signatureBytes)
 	}
 
-	signerBLSMessageFn := func(_ accounts.Account, data []byte, extraData []byte) ([]byte, error) {
+	signerBLSMessageFn := func(_ accounts.Account, data []byte, extraData []byte) (blscrypto.SerializedSignature, error) {
 		key := nodeKeys[0]
 		privateKeyBytes, err := blscrypto.ECDSAToBLS(key)
 		if err != nil {
-			return nil, err
+			return blscrypto.SerializedSignature{}, err
 		}
 
 		privateKey, err := bls.DeserializePrivateKey(privateKeyBytes)
 		if err != nil {
-			return nil, err
+			return blscrypto.SerializedSignature{}, err
 		}
 		defer privateKey.Destroy()
 
 		signature, err := privateKey.SignMessage(data, extraData, true)
 		if err != nil {
-			return nil, err
+			return blscrypto.SerializedSignature{}, err
 		}
 		defer signature.Destroy()
 		signatureBytes, err := signature.Serialize()
 		if err != nil {
-			return nil, err
+			return blscrypto.SerializedSignature{}, err
 		}
 
-		return signatureBytes, nil
+		return blscrypto.SerializedSignatureFromBytes(signatureBytes)
 	}
 
-	dataDir := createRandomDataDir()
-	b, _ := New(config, memDB, dataDir).(*Backend)
-	b.Authorize(address, signerFn, signerBLSHashFn, signerBLSMessageFn)
+	b, _ := New(config, memDB).(*Backend)
+	b.Authorize(address, &publicKey, decryptFn, signerFn, signerBLSHashFn, signerBLSMessageFn)
 
 	genesis.MustCommit(memDB)
 
@@ -123,18 +123,20 @@ func newBlockChain(n int, isFullChain bool) (*core.BlockChain, *Backend) {
 		panic(err)
 	}
 
-	b.SetChain(blockchain, blockchain.CurrentBlock)
-
-	b.Start(blockchain.HasBadBlock,
-		func(parentHash common.Hash) (*state.StateDB, error) {
-			parentStateRoot := blockchain.GetHeaderByHash(parentHash).Root
-			return blockchain.StateAt(parentStateRoot)
-		},
+	b.SetChain(blockchain, blockchain.CurrentBlock,
+		func(hash common.Hash) (*state.StateDB, error) {
+			stateRoot := blockchain.GetHeaderByHash(hash).Root
+			return blockchain.StateAt(stateRoot)
+		})
+	b.SetBroadcaster(&consensustest.MockBroadcaster{})
+	b.SetP2PServer(consensustest.NewMockP2PServer())
+	b.StartAnnouncing()
+	b.StartValidating(blockchain.HasBadBlock,
 		func(block *types.Block, state *state.StateDB) (types.Receipts, []*types.Log, uint64, error) {
 			return blockchain.Processor().Process(block, state, *blockchain.GetVMConfig())
 		},
 		func(block *types.Block, state *state.StateDB, receipts types.Receipts, usedGas uint64) error {
-			return blockchain.Validator().ValidateState(block, nil, state, receipts, usedGas)
+			return blockchain.Validator().ValidateState(block, state, receipts, usedGas)
 		})
 	snap, err := b.snapshot(blockchain, 0, common.Hash{}, nil)
 	if err != nil {
@@ -143,67 +145,67 @@ func newBlockChain(n int, isFullChain bool) (*core.BlockChain, *Backend) {
 	if snap == nil {
 		panic("failed to get snapshot")
 	}
-	proposerAddr := snap.ValSet.GetProposer().Address()
+	proposerAddr := b.AuthorForBlock(snap.Number)
+	// proposerAddr := snap.ValSet.GetProposer().Address()
 
 	// find proposer key
 	for _, key := range nodeKeys {
 		addr := crypto.PubkeyToAddress(key.PublicKey)
 		if addr.String() == proposerAddr.String() {
-			signerFn := func(_ accounts.Account, data []byte) ([]byte, error) {
+			signerFn := func(_ accounts.Account, mimeType string, data []byte) ([]byte, error) {
 				return crypto.Sign(data, key)
 			}
-			signerBLSHashFn := func(_ accounts.Account, data []byte) ([]byte, error) {
+			signerBLSHashFn := func(_ accounts.Account, data []byte) (blscrypto.SerializedSignature, error) {
 				privateKeyBytes, err := blscrypto.ECDSAToBLS(key)
 				if err != nil {
-					return nil, err
+					return blscrypto.SerializedSignature{}, err
 				}
 
 				privateKey, err := bls.DeserializePrivateKey(privateKeyBytes)
 				if err != nil {
-					return nil, err
+					return blscrypto.SerializedSignature{}, err
 				}
 				defer privateKey.Destroy()
 
 				signature, err := privateKey.SignMessage(data, []byte{}, false)
 				if err != nil {
-					return nil, err
+					return blscrypto.SerializedSignature{}, err
 				}
 				defer signature.Destroy()
 				signatureBytes, err := signature.Serialize()
 				if err != nil {
-					return nil, err
+					return blscrypto.SerializedSignature{}, err
 				}
 
-				return signatureBytes, nil
+				return blscrypto.SerializedSignatureFromBytes(signatureBytes)
 			}
 
-			signerBLSMessageFn := func(_ accounts.Account, data []byte, extraData []byte) ([]byte, error) {
+			signerBLSMessageFn := func(_ accounts.Account, data []byte, extraData []byte) (blscrypto.SerializedSignature, error) {
 				privateKeyBytes, err := blscrypto.ECDSAToBLS(key)
 				if err != nil {
-					return nil, err
+					return blscrypto.SerializedSignature{}, err
 				}
 
 				privateKey, err := bls.DeserializePrivateKey(privateKeyBytes)
 				if err != nil {
-					return nil, err
+					return blscrypto.SerializedSignature{}, err
 				}
 				defer privateKey.Destroy()
 
 				signature, err := privateKey.SignMessage(data, extraData, true)
 				if err != nil {
-					return nil, err
+					return blscrypto.SerializedSignature{}, err
 				}
 				defer signature.Destroy()
 				signatureBytes, err := signature.Serialize()
 				if err != nil {
-					return nil, err
+					return blscrypto.SerializedSignature{}, err
 				}
 
-				return signatureBytes, nil
+				return blscrypto.SerializedSignatureFromBytes(signatureBytes)
 			}
 
-			b.Authorize(address, signerFn, signerBLSHashFn, signerBLSMessageFn)
-			b.SetBroadcaster(&MockBroadcaster{privateKey: key})
+			b.Authorize(address, &publicKey, decryptFn, signerFn, signerBLSHashFn, signerBLSMessageFn)
 			break
 		}
 	}
@@ -211,22 +213,6 @@ func newBlockChain(n int, isFullChain bool) (*core.BlockChain, *Backend) {
 	contract_comm.SetInternalEVMHandler(blockchain)
 
 	return blockchain, b
-}
-
-func createRandomDataDir() string {
-	rand.Seed(time.Now().UnixNano())
-	for {
-		dirName := "geth_ibft_" + strconv.Itoa(rand.Int()%1000000)
-		dataDir := filepath.Join("/tmp", dirName)
-		err := os.Mkdir(dataDir, 0700)
-		if os.IsExist(err) {
-			continue // Re-try
-		}
-		if err != nil {
-			panic("Failed to create dir: " + dataDir + " error: " + err.Error())
-		}
-		return dataDir
-	}
 }
 
 func getGenesisAndKeys(n int, isFullChain bool) (*core.Genesis, []*ecdsa.PrivateKey) {
@@ -245,24 +231,23 @@ func getGenesisAndKeys(n int, isFullChain bool) (*core.Genesis, []*ecdsa.Private
 		blsPrivateKey, _ := blscrypto.ECDSAToBLS(nodeKeys[i])
 		blsPublicKey, _ := blscrypto.PrivateToPublic(blsPrivateKey)
 		validators[i] = istanbul.ValidatorData{
-			addr,
-			blsPublicKey,
+			Address:      addr,
+			BLSPublicKey: blsPublicKey,
 		}
 
 	}
 
 	// generate genesis block
 	genesis := core.DefaultGenesisBlock()
-	genesis.Config = params.TestChainConfig
+	genesis.Config = params.DefaultChainConfig
 	if !isFullChain {
 		genesis.Config.FullHeaderChainAvailable = false
 	}
 	// force enable Istanbul engine
-	genesis.Config.Istanbul = &params.IstanbulConfig{}
-	genesis.Config.Ethash = nil
-	genesis.Difficulty = defaultDifficulty
-	genesis.Nonce = emptyNonce.Uint64()
-	genesis.Mixhash = types.IstanbulDigest
+	genesis.Config.Istanbul = &params.IstanbulConfig{
+		Epoch:          10,
+		LookbackWindow: 2,
+	}
 
 	AppendValidatorsToGenesisBlock(genesis, validators)
 	return genesis, nodeKeys
@@ -272,11 +257,9 @@ func makeHeader(parent *types.Block, config *istanbul.Config) *types.Header {
 	header := &types.Header{
 		ParentHash: parent.Hash(),
 		Number:     parent.Number().Add(parent.Number(), common.Big1),
-		GasLimit:   core.CalcGasLimit(parent, nil),
 		GasUsed:    0,
 		Extra:      parent.Extra(),
-		Time:       new(big.Int).Add(parent.Time(), new(big.Int).SetUint64(config.BlockPeriod)),
-		Difficulty: defaultDifficulty,
+		Time:       parent.Time() + config.BlockPeriod,
 	}
 	return header
 }
@@ -292,8 +275,15 @@ func makeBlock(chain *core.BlockChain, engine *Backend, parent *types.Block) *ty
 func makeBlockWithoutSeal(chain *core.BlockChain, engine *Backend, parent *types.Block) *types.Block {
 	header := makeHeader(parent, engine.config)
 	engine.Prepare(chain, header)
-	state, _ := chain.StateAt(parent.Root())
-	block, _ := engine.Finalize(chain, header, state, nil, nil, nil, nil)
+	state, err := chain.StateAt(parent.Root())
+	if err != nil {
+		fmt.Printf("Error!! %v\n", err)
+	}
+	engine.Finalize(chain, header, state, nil)
+	block, err := engine.FinalizeAndAssemble(chain, header, state, nil, nil, nil)
+	if err != nil {
+		fmt.Printf("Error!! %v\n", err)
+	}
 	return block
 }
 
@@ -361,10 +351,14 @@ func TestSealStopChannel(t *testing.T) {
 	}
 }
 
+// TestSealCommittedOtherHash checks that when Seal() ask for a commit, if we send a
+// different block hash, it will abort
 func TestSealCommittedOtherHash(t *testing.T) {
 	chain, engine := newBlockChain(4, true)
 	block := makeBlockWithoutSeal(chain, engine, chain.Genesis())
-	otherBlock := makeBlockWithoutSeal(chain, engine, block)
+
+	// create a second block which will have a different hash
+	otherBlock := makeBlockWithoutSeal(chain, engine, chain.Genesis())
 	eventSub := engine.EventMux().Subscribe(istanbul.RequestEvent{})
 	eventLoop := func() {
 		ev := <-eventSub.Chan()
@@ -372,7 +366,7 @@ func TestSealCommittedOtherHash(t *testing.T) {
 		if !ok {
 			t.Errorf("unexpected event comes: %v", reflect.TypeOf(ev.Data))
 		}
-		engine.Commit(otherBlock, types.IstanbulAggregatedSeal{})
+		engine.Commit(otherBlock, types.IstanbulAggregatedSeal{}, types.IstanbulEpochValidatorSetSeal{})
 		eventSub.Unsubscribe()
 	}
 	go eventLoop()
@@ -430,37 +424,10 @@ func TestVerifyHeader(t *testing.T) {
 		t.Errorf("error mismatch: have %v, want %v", err, errInvalidExtraDataFormat)
 	}
 
-	// non zero MixDigest
-	block = makeBlockWithoutSeal(chain, engine, chain.Genesis())
-	header = block.Header()
-	header.MixDigest = common.BytesToHash([]byte("123456789"))
-	err = engine.VerifyHeader(chain, header, false)
-	if err != errInvalidMixDigest {
-		t.Errorf("error mismatch: have %v, want %v", err, errInvalidMixDigest)
-	}
-
-	// invalid uncles hash
-	block = makeBlockWithoutSeal(chain, engine, chain.Genesis())
-	header = block.Header()
-	header.UncleHash = common.BytesToHash([]byte("123456789"))
-	err = engine.VerifyHeader(chain, header, false)
-	if err != errInvalidUncleHash {
-		t.Errorf("error mismatch: have %v, want %v", err, errInvalidUncleHash)
-	}
-
-	// invalid difficulty
-	block = makeBlockWithoutSeal(chain, engine, chain.Genesis())
-	header = block.Header()
-	header.Difficulty = big.NewInt(2)
-	err = engine.VerifyHeader(chain, header, false)
-	if err != errInvalidDifficulty {
-		t.Errorf("error mismatch: have %v, want %v", err, errInvalidDifficulty)
-	}
-
 	// invalid timestamp
 	block = makeBlockWithoutSeal(chain, engine, chain.Genesis())
 	header = block.Header()
-	header.Time = new(big.Int).Add(chain.Genesis().Time(), new(big.Int).SetUint64(engine.config.BlockPeriod-1))
+	header.Time = chain.Genesis().Time() + engine.config.BlockPeriod - 1
 	err = engine.VerifyHeader(chain, header, false)
 	if err != errInvalidTimestamp {
 		t.Errorf("error mismatch: have %v, want %v", err, errInvalidTimestamp)
@@ -469,20 +436,10 @@ func TestVerifyHeader(t *testing.T) {
 	// future block
 	block = makeBlockWithoutSeal(chain, engine, chain.Genesis())
 	header = block.Header()
-	header.Time = new(big.Int).Add(big.NewInt(now().Unix()), new(big.Int).SetUint64(10))
+	header.Time = uint64(now().Unix() + 10)
 	err = engine.VerifyHeader(chain, header, false)
 	if err != consensus.ErrFutureBlock {
 		t.Errorf("error mismatch: have %v, want %v", err, consensus.ErrFutureBlock)
-	}
-
-	// invalid nonce
-	block = makeBlockWithoutSeal(chain, engine, chain.Genesis())
-	header = block.Header()
-	copy(header.Nonce[:], hexutil.MustDecode("0x111111111111"))
-	header.Number = big.NewInt(int64(engine.config.Epoch))
-	err = engine.VerifyHeader(chain, header, false)
-	if err != errInvalidNonce {
-		t.Errorf("error mismatch: have %v, want %v", err, errInvalidNonce)
 	}
 }
 
@@ -496,17 +453,41 @@ func TestVerifySeal(t *testing.T) {
 	}
 
 	block := makeBlock(chain, engine, genesis)
-	// change block content
+
+	// change header content and expect to invalidate signature
 	header := block.Header()
 	header.Number = big.NewInt(4)
-	block1 := block.WithSeal(header)
-	err = engine.VerifySeal(chain, block1.Header())
-	if err != errUnauthorized {
-		t.Errorf("error mismatch: have %v, want %v", err, errUnauthorized)
+	err = engine.VerifySeal(chain, header)
+	if err != errInvalidSignature {
+		t.Errorf("error mismatch: have %v, want %v", err, errInvalidSignature)
 	}
 
-	// unauthorized users but still can get correct signer address
-	engine.Authorize(common.Address{}, nil, nil, nil)
+	// delete istanbul extra data and expect invalid extra data format
+	header = block.Header()
+	header.Extra = nil
+	err = engine.VerifySeal(chain, header)
+	if err != errInvalidExtraDataFormat {
+		t.Errorf("error mismatch: have %v, want %v", err, errInvalidExtraDataFormat)
+	}
+
+	// modify seal bitmap and expect to fail the quorum check
+	header = block.Header()
+	extra, err := types.ExtractIstanbulExtra(header)
+	if err != nil {
+		t.Fatalf("failed to extract istanbul data: %v", err)
+	}
+	extra.AggregatedSeal.Bitmap = big.NewInt(0)
+	encoded, err := rlp.EncodeToBytes(extra)
+	if err != nil {
+		t.Fatalf("failed to encode istanbul data: %v", err)
+	}
+	header.Extra = append(header.Extra[:types.IstanbulExtraVanity], encoded...)
+	err = engine.VerifySeal(chain, header)
+	if err != errInsufficientSeals {
+		t.Errorf("error mismatch: have %v, want %v", err, errInsufficientSeals)
+	}
+
+	// verifiy the seal on the unmodified block.
 	err = engine.VerifySeal(chain, block.Header())
 	if err != nil {
 		t.Errorf("error mismatch: have %v, want nil", err)
@@ -531,11 +512,12 @@ func TestVerifyHeaders(t *testing.T) {
 			b = makeBlockWithoutSeal(chain, engine, blocks[i-1])
 			b, _ = engine.updateBlock(blocks[i-1].Header(), b)
 		}
+
 		blocks = append(blocks, b)
 		headers = append(headers, blocks[i].Header())
 	}
 	now = func() time.Time {
-		return time.Unix(headers[size-1].Time.Int64(), 0)
+		return time.Unix(int64(headers[size-1].Time), 0)
 	}
 	_, results := engine.VerifyHeaders(chain, headers, nil)
 	const timeoutDura = 2 * time.Second
@@ -587,7 +569,7 @@ OUT2:
 	}
 	// error header cases
 	headers[2].Number = big.NewInt(100)
-	abort, results = engine.VerifyHeaders(chain, headers, nil)
+	_, results = engine.VerifyHeaders(chain, headers, nil)
 	timeout = time.NewTimer(timeoutDura)
 	index = 0
 	errors := 0
@@ -620,7 +602,7 @@ func TestVerifyHeaderWithoutFullChain(t *testing.T) {
 	// allow future block without full chain available
 	block := makeBlockWithoutSeal(chain, engine, chain.Genesis())
 	header := block.Header()
-	header.Time = new(big.Int).Add(big.NewInt(now().Unix()), new(big.Int).SetUint64(3))
+	header.Time = uint64(now().Unix() + 3)
 	err := engine.VerifyHeader(chain, header, false)
 	if err != errEmptyAggregatedSeal {
 		t.Errorf("error mismatch: have %v, want %v", err, errEmptyAggregatedSeal)
@@ -629,7 +611,7 @@ func TestVerifyHeaderWithoutFullChain(t *testing.T) {
 	// reject future block without full chain available
 	block = makeBlockWithoutSeal(chain, engine, chain.Genesis())
 	header = block.Header()
-	header.Time = new(big.Int).Add(big.NewInt(now().Unix()), new(big.Int).SetUint64(10))
+	header.Time = uint64(now().Unix() + 10)
 	err = engine.VerifyHeader(chain, header, false)
 	if err != consensus.ErrFutureBlock {
 		t.Errorf("error mismatch: have %v, want %v", err, consensus.ErrFutureBlock)
@@ -639,33 +621,35 @@ func TestVerifyHeaderWithoutFullChain(t *testing.T) {
 func TestPrepareExtra(t *testing.T) {
 	oldValidators := make([]istanbul.ValidatorData, 2)
 	oldValidators[0] = istanbul.ValidatorData{
-		common.BytesToAddress(hexutil.MustDecode("0x44add0ec310f115a0e603b2d7db9f067778eaf8a")),
-		make([]byte, blscrypto.PUBLICKEYBYTES),
+		Address:      common.BytesToAddress(hexutil.MustDecode("0x44add0ec310f115a0e603b2d7db9f067778eaf8a")),
+		BLSPublicKey: blscrypto.SerializedPublicKey{},
 	}
 	oldValidators[1] = istanbul.ValidatorData{
-		common.BytesToAddress(hexutil.MustDecode("0x294fc7e8f22b3bcdcf955dd7ff3ba2ed833f8212")),
-		make([]byte, blscrypto.PUBLICKEYBYTES),
+		Address:      common.BytesToAddress(hexutil.MustDecode("0x294fc7e8f22b3bcdcf955dd7ff3ba2ed833f8212")),
+		BLSPublicKey: blscrypto.SerializedPublicKey{},
 	}
 
 	newValidators := make([]istanbul.ValidatorData, 2)
 	newValidators[0] = istanbul.ValidatorData{
-		common.BytesToAddress(hexutil.MustDecode("0x6beaaed781d2d2ab6350f5c4566a2c6eaac407a6")),
-		make([]byte, blscrypto.PUBLICKEYBYTES),
+		Address:      common.BytesToAddress(hexutil.MustDecode("0x6beaaed781d2d2ab6350f5c4566a2c6eaac407a6")),
+		BLSPublicKey: blscrypto.SerializedPublicKey{},
 	}
 	newValidators[1] = istanbul.ValidatorData{
-		common.BytesToAddress(hexutil.MustDecode("0x8be76812f765c24641ec63dc2852b378aba2b440")),
-		make([]byte, blscrypto.PUBLICKEYBYTES),
+		Address:      common.BytesToAddress(hexutil.MustDecode("0x8be76812f765c24641ec63dc2852b378aba2b440")),
+		BLSPublicKey: blscrypto.SerializedPublicKey{},
 	}
 
 	extra, err := rlp.EncodeToBytes(&types.IstanbulExtra{
 		AddedValidators:           []common.Address{},
-		AddedValidatorsPublicKeys: [][]byte{},
+		AddedValidatorsPublicKeys: []blscrypto.SerializedPublicKey{},
 		RemovedValidators:         big.NewInt(0),
 		Seal:                      []byte{},
 		AggregatedSeal:            types.IstanbulAggregatedSeal{},
 		ParentAggregatedSeal:      types.IstanbulAggregatedSeal{},
-		EpochData:                 []byte{},
 	})
+	if err != nil {
+		t.Errorf("error: %v", err)
+	}
 	h := &types.Header{
 		Extra: append(make([]byte, types.IstanbulExtraVanity), extra...),
 	}
@@ -708,14 +692,16 @@ func TestWriteSeal(t *testing.T) {
 			common.BytesToAddress(hexutil.MustDecode("0x6beaaed781d2d2ab6350f5c4566a2c6eaac407a6")),
 			common.BytesToAddress(hexutil.MustDecode("0x8be76812f765c24641ec63dc2852b378aba2b440")),
 		},
-		AddedValidatorsPublicKeys: [][]byte{},
+		AddedValidatorsPublicKeys: []blscrypto.SerializedPublicKey{},
 		RemovedValidators:         big.NewInt(12), // 1100, remove third and fourth validators
 		Seal:                      []byte{},
-		AggregatedSeal:            types.IstanbulAggregatedSeal{big.NewInt(0), []byte{}, big.NewInt(0)},
-		ParentAggregatedSeal:      types.IstanbulAggregatedSeal{big.NewInt(0), []byte{}, big.NewInt(0)},
-		EpochData:                 []byte{},
+		AggregatedSeal:            types.IstanbulAggregatedSeal{Bitmap: big.NewInt(0), Signature: []byte{}, Round: big.NewInt(0)},
+		ParentAggregatedSeal:      types.IstanbulAggregatedSeal{Bitmap: big.NewInt(0), Signature: []byte{}, Round: big.NewInt(0)},
 	}
 	istExtraRaw, err := rlp.EncodeToBytes(&istExtra)
+	if err != nil {
+		t.Errorf("error: %v", err)
+	}
 
 	expectedSeal := hexutil.MustDecode("0x29fe2612266a3965321c23a2e0382cd819e992f293d9a0032439728e41201d2c387cc9de5914a734873d79addb76c59ce73c1085a98b968384811b4ad050dddc56")
 	if len(expectedSeal) != types.IstanbulExtraSeal {
@@ -760,14 +746,16 @@ func TestWriteAggregatedSeal(t *testing.T) {
 			common.BytesToAddress(hexutil.MustDecode("0x6beaaed781d2d2ab6350f5c4566a2c6eaac407a6")),
 			common.BytesToAddress(hexutil.MustDecode("0x8be76812f765c24641ec63dc2852b378aba2b440")),
 		},
-		AddedValidatorsPublicKeys: [][]byte{},
+		AddedValidatorsPublicKeys: []blscrypto.SerializedPublicKey{},
 		RemovedValidators:         big.NewInt(12), // 1100, remove third and fourth validators
 		Seal:                      []byte{},
 		AggregatedSeal:            types.IstanbulAggregatedSeal{},
 		ParentAggregatedSeal:      types.IstanbulAggregatedSeal{},
-		EpochData:                 []byte{},
 	}
 	istExtraRaw, err := rlp.EncodeToBytes(&istExtra)
+	if err != nil {
+		t.Errorf("error: %v", err)
+	}
 
 	aggregatedSeal := types.IstanbulAggregatedSeal{
 		Round:     big.NewInt(2),

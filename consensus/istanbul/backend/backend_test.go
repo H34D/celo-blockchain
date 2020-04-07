@@ -17,22 +17,21 @@
 package backend
 
 import (
-	//"bytes"
 	"crypto/ecdsa"
-	"fmt"
 	"math/big"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/celo-org/bls-zexe/go"
+	"github.com/celo-org/bls-zexe/go/bls"
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
 	"github.com/ethereum/go-ethereum/consensus/istanbul/validator"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/crypto/bls"
+	blscrypto "github.com/ethereum/go-ethereum/crypto/bls"
+	"github.com/ethereum/go-ethereum/crypto/ecies"
 )
 
 func TestSign(t *testing.T) {
@@ -43,7 +42,7 @@ func TestSign(t *testing.T) {
 		t.Errorf("error mismatch: have %v, want nil", err)
 	}
 	//Check signature recover
-	hashData := crypto.Keccak256([]byte(data))
+	hashData := crypto.Keccak256(data)
 	pubkey, _ := crypto.Ecrecover(hashData, sig)
 	var signer common.Address
 	copy(signer[:], crypto.Keccak256(pubkey[1:])[12:])
@@ -55,7 +54,7 @@ func TestSign(t *testing.T) {
 func TestCheckSignature(t *testing.T) {
 	key, _ := generatePrivateKey()
 	data := []byte("Here is a string....")
-	hashData := crypto.Keccak256([]byte(data))
+	hashData := crypto.Keccak256(data)
 	sig, _ := crypto.Sign(hashData, key)
 	b := newBackend()
 	a := getAddress()
@@ -71,11 +70,12 @@ func TestCheckSignature(t *testing.T) {
 }
 
 func TestCheckValidatorSignature(t *testing.T) {
+
 	vset, keys := newTestValidatorSet(5)
 
 	// 1. Positive test: sign with validator's key should succeed
 	data := []byte("dummy data")
-	hashData := crypto.Keccak256([]byte(data))
+	hashData := crypto.Keccak256(data)
 	for i, k := range keys {
 		// Sign
 		sig, err := crypto.Sign(hashData, k)
@@ -157,7 +157,7 @@ func TestCommit(t *testing.T) {
 		}()
 
 		backend.proposedBlockHash = expBlock.Hash()
-		if err := backend.Commit(expBlock, types.IstanbulAggregatedSeal{Round: big.NewInt(0), Bitmap: big.NewInt(0), Signature: test.expectedSignature}); err != nil {
+		if err := backend.Commit(expBlock, types.IstanbulAggregatedSeal{Round: big.NewInt(0), Bitmap: big.NewInt(0), Signature: test.expectedSignature}, types.IstanbulEpochValidatorSetSeal{Signature: nil}); err != nil {
 			if err != test.expectedErr {
 				t.Errorf("error mismatch: have %v, want %v", err, test.expectedErr)
 			}
@@ -179,10 +179,9 @@ func TestCommit(t *testing.T) {
 
 func TestGetProposer(t *testing.T) {
 	chain, engine := newBlockChain(1, true)
-	fmt.Printf("Data dir is %s\n", engine.GetDataDir())
 	block := makeBlock(chain, engine, chain.Genesis())
 	chain.InsertChain(types.Blocks{block})
-	expected := engine.GetProposer(1)
+	expected := engine.AuthorForBlock(1)
 	actual := engine.Address()
 	if actual != expected {
 		t.Errorf("proposer mismatch: have %v, want %v, currentblock: %v", actual.Hex(), expected.Hex(), chain.CurrentBlock().Number())
@@ -208,11 +207,6 @@ func generatePrivateKey() (*ecdsa.PrivateKey, error) {
 	return crypto.HexToECDSA(key)
 }
 
-func generateInvalidPrivateKey() (*ecdsa.PrivateKey, error) {
-	key := "1049c0e0b99eeea3465a1e83a52900dc27c652f39abb3aed3b868dee68ff1d2c"
-	return crypto.HexToECDSA(key)
-}
-
 func newTestValidatorSet(n int) (istanbul.ValidatorSet, []*ecdsa.PrivateKey) {
 	// generate validators
 	keys := make(Keys, n)
@@ -223,11 +217,11 @@ func newTestValidatorSet(n int) (istanbul.ValidatorSet, []*ecdsa.PrivateKey) {
 		blsPublicKey, _ := blscrypto.PrivateToPublic(blsPrivateKey)
 		keys[i] = privateKey
 		validators[i] = istanbul.ValidatorData{
-			crypto.PubkeyToAddress(privateKey.PublicKey),
-			blsPublicKey,
+			Address:      crypto.PubkeyToAddress(privateKey.PublicKey),
+			BLSPublicKey: blsPublicKey,
 		}
 	}
-	vset := validator.NewSet(validators, istanbul.RoundRobin)
+	vset := validator.NewSet(validators)
 	return vset, keys
 }
 
@@ -245,72 +239,73 @@ func (slice Keys) Swap(i, j int) {
 	slice[i], slice[j] = slice[j], slice[i]
 }
 
-func signerFn(_ accounts.Account, data []byte) ([]byte, error) {
-	key, _ := generatePrivateKey()
-	return crypto.Sign(data, key)
+func decryptFn(_ accounts.Account, c, s1, s2 []byte) ([]byte, error) {
+	ecdsaKey, _ := generatePrivateKey()
+	eciesKey := ecies.ImportECDSA(ecdsaKey)
+	return eciesKey.Decrypt(c, s1, s2)
 }
 
-func signerBLSHashFn(_ accounts.Account, data []byte) ([]byte, error) {
+func signerFn(_ accounts.Account, mimeType string, data []byte) ([]byte, error) {
+	key, _ := generatePrivateKey()
+	return crypto.Sign(crypto.Keccak256(data), key)
+}
+
+func signerBLSHashFn(_ accounts.Account, data []byte) (blscrypto.SerializedSignature, error) {
 	key, _ := generatePrivateKey()
 	privateKeyBytes, err := blscrypto.ECDSAToBLS(key)
 	if err != nil {
-		return nil, err
+		return blscrypto.SerializedSignature{}, err
 	}
 
 	privateKey, err := bls.DeserializePrivateKey(privateKeyBytes)
 	if err != nil {
-		return nil, err
+		return blscrypto.SerializedSignature{}, err
 	}
 	defer privateKey.Destroy()
 
 	signature, err := privateKey.SignMessage(data, []byte{}, false)
 	if err != nil {
-		return nil, err
+		return blscrypto.SerializedSignature{}, err
 	}
 	defer signature.Destroy()
 	signatureBytes, err := signature.Serialize()
 	if err != nil {
-		return nil, err
+		return blscrypto.SerializedSignature{}, err
 	}
 
-	return signatureBytes, nil
+	return blscrypto.SerializedSignatureFromBytes(signatureBytes)
 }
 
-func signerBLSMessageFn(_ accounts.Account, data []byte, extraData []byte) ([]byte, error) {
+func signerBLSMessageFn(_ accounts.Account, data []byte, extraData []byte) (blscrypto.SerializedSignature, error) {
 	key, _ := generatePrivateKey()
 	privateKeyBytes, err := blscrypto.ECDSAToBLS(key)
 	if err != nil {
-		return nil, err
+		return blscrypto.SerializedSignature{}, err
 	}
 
 	privateKey, err := bls.DeserializePrivateKey(privateKeyBytes)
 	if err != nil {
-		return nil, err
+		return blscrypto.SerializedSignature{}, err
 	}
 	defer privateKey.Destroy()
 
 	signature, err := privateKey.SignMessage(data, extraData, true)
 	if err != nil {
-		return nil, err
+		return blscrypto.SerializedSignature{}, err
 	}
 	defer signature.Destroy()
 	signatureBytes, err := signature.Serialize()
 	if err != nil {
-		return nil, err
+		return blscrypto.SerializedSignature{}, err
 	}
 
-	return signatureBytes, nil
+	return blscrypto.SerializedSignatureFromBytes(signatureBytes)
 }
 
 func newBackend() (b *Backend) {
 	_, b = newBlockChain(4, true)
 
 	key, _ := generatePrivateKey()
-	b.Authorize(crypto.PubkeyToAddress(key.PublicKey), signerFn, signerBLSHashFn, signerBLSMessageFn)
+	b.Authorize(crypto.PubkeyToAddress(key.PublicKey), &key.PublicKey, decryptFn, signerFn, signerBLSHashFn, signerBLSMessageFn)
 	return
-}
-
-func signerFnInvalid(_ accounts.Account, data []byte) ([]byte, error) {
-	key, _ := generateInvalidPrivateKey()
-	return crypto.Sign(data, key)
 }
